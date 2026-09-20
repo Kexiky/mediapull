@@ -1,0 +1,1373 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MediaPull — Universal Media Downloader | by Kexiky</title>
+  <meta name="description" content="MediaPull by Kexiky — Быстрое и универсальное скачивание медиа с YouTube, Instagram, TikTok, VK и сотен других сайтов.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=20260918_v2">
+  <script>
+    (function() {
+      try {
+        var theme = localStorage.getItem('mediapull_theme') || 'cyan';
+        var mode = localStorage.getItem('mediapull_mode') || 'dark';
+        document.documentElement.setAttribute('data-theme', theme);
+        document.documentElement.setAttribute('data-mode', mode);
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body>
+  <!-- Ambient background glow elements -->
+  <div class="glow glow-1"></div>
+  <div class="glow glow-2"></div>
+  <div class="glow glow-3"></div>
+
+  <!-- Main Container -->
+  <div class="app-container">
+    
+    <!-- Header -->
+    <header class="navbar">
+      <div class="logo-group">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+        </div>
+        <div class="logo-text">
+          <div class="brand-title-wrap">
+            <span class="brand-title">MediaPull</span>
+            <span class="brand-author-tag">by kexiky</span>
+          </div>
+          <span class="brand-subtitle">Universal Downloader &bull; 4K &bull; Multiplatform</span>
+        </div>
+      </div>
+
+      <div class="navbar-right">
+        <nav class="nav-tabs" role="tablist">
+          <button class="nav-tab active" id="tabBtnDownloader" onclick="switchMainTab('downloader')" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+            <span>Загрузчик</span>
+          </button>
+          <button class="nav-tab" id="tabBtnHistory" onclick="switchMainTab('history')" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            <span>Мои файлы <span class="files-badge" id="filesCountBadge">0</span></span>
+          </button>
+        </nav>
+
+        <div class="navbar-divider"></div>
+
+        <button type="button" class="btn-navbar-queue" id="btnDownloadsDrawer" onclick="toggleDownloadsDrawer()" title="Очередь задач">
+          <div class="queue-icon-wrapper">
+            <svg class="queue-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="9" y1="6" x2="20" y2="6"></line>
+              <line x1="9" y1="12" x2="20" y2="12"></line>
+              <line x1="9" y1="18" x2="20" y2="18"></line>
+              <circle cx="4" cy="6" r="1.5" fill="currentColor"></circle>
+              <circle cx="4" cy="12" r="1.5" fill="currentColor"></circle>
+              <circle cx="4" cy="18" r="1.5" fill="currentColor"></circle>
+            </svg>
+            <span class="drawer-pulse-dot" id="drawerPulseDot" style="display: none;"></span>
+          </div>
+          <span class="queue-label">Очередь</span>
+          <span class="queue-counter-badge" id="drawerQueueBadge" style="display: none;">0</span>
+        </button>
+
+        <div class="navbar-divider"></div>
+
+        <!-- Theme Switcher Container -->
+        <div class="theme-menu-container" id="themeMenuContainer">
+          <button type="button" class="btn-navbar-theme" id="btnThemeMenu" onclick="toggleThemeDropdown(event)" title="Выбор темы оформления" aria-label="Выбор темы оформления" aria-haspopup="true" aria-expanded="false">
+            <div class="theme-icon-wrap">
+              <span class="theme-mode-icon" id="navbarModeIcon">
+                <svg class="icon-moon" id="iconMoonSvg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+                <svg class="icon-sun" id="iconSunSvg" style="display: none;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+              </span>
+              <span class="theme-color-indicator" id="navbarThemeDot"></span>
+            </div>
+          </button>
+
+          <!-- Dropdown Menu -->
+          <div class="theme-dropdown-menu" id="themeDropdownMenu" role="menu" onclick="event.stopPropagation()">
+            <div class="theme-dropdown-header">
+              <div class="theme-dropdown-top-row">
+                <span class="theme-dropdown-title">Оформление</span>
+                <span class="theme-header-mode-badge" id="themeHeaderModeBadge">Тёмная тема</span>
+              </div>
+              <!-- Mode Segmented Toggle: Dark / Light (Full width) -->
+              <div class="theme-mode-toggle-group">
+                <button type="button" class="theme-mode-btn active" id="modeBtnDark" onclick="setAppMode('dark')" title="Тёмный режим">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+                  <span>Тёмная</span>
+                </button>
+                <button type="button" class="theme-mode-btn" id="modeBtnLight" onclick="setAppMode('light')" title="Светлый режим">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+                  <span>Светлая</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="theme-dropdown-section-title">Цветовая палитра</div>
+
+            <div class="theme-options-list">
+              <!-- 1. Electric Cyan -->
+              <button type="button" class="theme-option-item active" data-theme-val="cyan" onclick="setAppTheme('cyan')">
+                <div class="theme-option-swatch swatch-cyan"></div>
+                <div class="theme-option-info">
+                  <div class="theme-option-name-row">
+                    <span class="theme-name">Electric Cyan</span>
+                    <span class="theme-tag">Default</span>
+                  </div>
+                  <span class="theme-desc">Арктический циан, лазурь и индиго</span>
+                </div>
+                <svg class="theme-check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </button>
+
+              <!-- 2. Monochrome Platinum -->
+              <button type="button" class="theme-option-item" data-theme-val="monochrome" onclick="setAppTheme('monochrome')">
+                <div class="theme-option-swatch swatch-monochrome"></div>
+                <div class="theme-option-info">
+                  <div class="theme-option-name-row">
+                    <span class="theme-name">Monochrome</span>
+                    <span class="theme-tag">Minimal</span>
+                  </div>
+                  <span class="theme-desc">Чистая платина, графит и обсидиан</span>
+                </div>
+                <svg class="theme-check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </button>
+
+              <!-- 3. Nordic Indigo -->
+              <button type="button" class="theme-option-item" data-theme-val="indigo" onclick="setAppTheme('indigo')">
+                <div class="theme-option-swatch swatch-indigo"></div>
+                <div class="theme-option-info">
+                  <div class="theme-option-name-row">
+                    <span class="theme-name">Nordic Indigo</span>
+                    <span class="theme-tag">Pro</span>
+                  </div>
+                  <span class="theme-desc">Глубокий полуночный индиго и сапфир</span>
+                </div>
+                <svg class="theme-check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </button>
+
+              <!-- 4. Cyber Emerald -->
+              <button type="button" class="theme-option-item" data-theme-val="emerald" onclick="setAppTheme('emerald')">
+                <div class="theme-option-swatch swatch-emerald"></div>
+                <div class="theme-option-info">
+                  <div class="theme-option-name-row">
+                    <span class="theme-name">Cyber Emerald</span>
+                    <span class="theme-tag">Matrix</span>
+                  </div>
+                  <span class="theme-desc">Неоновая мята и благородный изумруд</span>
+                </div>
+                <svg class="theme-check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </button>
+
+              <!-- 5. Crimson Classic -->
+              <button type="button" class="theme-option-item" data-theme-val="crimson" onclick="setAppTheme('crimson')">
+                <div class="theme-option-swatch swatch-crimson"></div>
+                <div class="theme-option-info">
+                  <div class="theme-option-name-row">
+                    <span class="theme-name">Crimson Classic</span>
+                    <span class="theme-tag">Classic</span>
+                  </div>
+                  <span class="theme-desc">Оригинальный рубиновый YouTube стиль</span>
+                </div>
+                <svg class="theme-check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="navbar-divider"></div>
+
+        <button type="button" class="btn-navbar-profile" id="btnUserProfile" onclick="handleUserProfileClick()" title="Профиль пользователя">
+          <div class="profile-avatar" id="userProfileAvatar">👑</div>
+          <div class="profile-meta">
+            <span class="profile-name" id="userProfileName">kexiky</span>
+            <span class="profile-badge-tier" id="userProfileTier">♾️ Вечно</span>
+          </div>
+        </button>
+      </div>
+    </header>
+
+    <!-- TAB 1: Downloader -->
+    <main class="tab-content" id="tabDownloader">
+      <!-- Search Box Hero Card -->
+      <section class="hero-card">
+        <h1 class="hero-title">Универсальное скачивание медиа</h1>
+        <p class="hero-desc">Вставьте ссылку на YouTube, Instagram, TikTok, VK, RuTube и другие сервисы. Выберите качество, формат, фрагмент для обрезки или скачайте весь плейлист.</p>
+        
+        <form class="url-form" id="urlForm" onsubmit="event.preventDefault(); fetchVideoInfo();">
+          <div class="input-wrapper">
+            <div class="input-prefix-icon" id="inputPrefixIcon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+              </svg>
+            </div>
+            <div class="platform-badge" id="platformBadge" style="display: none;"></div>
+            <input 
+              type="text" 
+              id="videoUrlInput" 
+              class="url-input" 
+              placeholder="Вставьте ссылку: YouTube, VK Видео, RuTube, TikTok, Twitch, X..." 
+              autocomplete="off"
+              spellcheck="false"
+              required
+              oninput="handleUrlInputChange(this.value)"
+            >
+            <button type="button" class="btn-clear" id="btnClear" title="Очистить" onclick="clearInput()" style="display: none;">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+            <button type="button" class="btn-paste" id="btnPaste" title="Вставить из буфера обмена" onclick="handlePasteClipboard()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>
+              <span>Вставить</span>
+            </button>
+          </div>
+          <button type="submit" class="btn-fetch" id="btnFetch">
+            <svg class="icon-sparkle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+            <span>Анализировать</span>
+          </button>
+        </form>
+
+        <!-- Quick Demo Chips -->
+        <div class="quick-chips">
+          <span class="quick-label">Быстрый тест:</span>
+          <button type="button" class="chip" onclick="setTestUrl('https://www.youtube.com/watch?v=dQw4w9WgXcQ')">
+            <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            <span>Rick Astley - Never Gonna Give You Up</span>
+          </button>
+          <button type="button" class="chip" onclick="setTestUrl('https://www.youtube.com/watch?v=jNQXAC9IVRw')">
+            <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            <span>Me at the zoo (First YouTube Video)</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- Skeleton Loading State -->
+      <section class="loading-card" id="loadingState" style="display: none;">
+        <div class="loader-spinner"></div>
+        <h3 class="loading-text" id="loadingStepText">Анализ ссылки и получение форматов...</h3>
+        <p class="loading-subtext">yt-dlp извлекает потоки, плейлисты, субтитры и метаданные</p>
+      </section>
+
+      <!-- Playlist Batch Card -->
+      <section class="playlist-config-container" id="playlistConfigSection" style="display: none;">
+        <div class="playlist-card">
+          <!-- YouTube-style Playlist Preview Hero Banner with stacked cover -->
+          <div class="playlist-preview-banner" id="playlistPreviewBanner">
+            <div class="playlist-preview-cover-stack">
+              <div class="playlist-stack-layer-2"></div>
+              <div class="playlist-stack-layer-1"></div>
+              <div class="playlist-cover-wrapper">
+                <img id="playlistPreviewCover" class="playlist-preview-cover-img" src="" alt="Обложка плейлиста" onerror="this.style.opacity='0.4'" />
+                <div class="playlist-cover-overlay">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12zm-8-2 6-4-6-4v8z"/></svg>
+                  <span id="playlistCoverCount">0 видео</span>
+                </div>
+              </div>
+            </div>
+            <div class="playlist-preview-meta">
+              <div class="playlist-platform-tag">
+                <span class="playlist-pill-badge" id="playlistTypeBadge">📁 ПЛЕЙЛИСТ</span>
+                <span class="playlist-platform-name" id="playlistPlatformName">YouTube</span>
+              </div>
+              <h2 class="playlist-preview-title" id="playlistBannerTitleText">Название плейлиста</h2>
+              <div class="playlist-preview-author">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+                <span id="playlistAuthor">Канал</span>
+              </div>
+              <div class="playlist-preview-stats">
+                <span id="playlistBannerCountText">0 видео</span>
+                <span class="meta-separator">•</span>
+                <span id="playlistSelectStatusText">Выбрано: все</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="playlist-header">
+            <div class="playlist-header-left">
+              <div class="playlist-badge">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+                <span id="playlistTitle">Список треков</span>
+              </div>
+              <span class="playlist-count-tag" id="playlistCountTag">0 видео</span>
+            </div>
+            <div class="playlist-header-right">
+              <button type="button" class="btn-select-all" id="btnPlaylistSelectAll" onclick="togglePlaylistSelectAll()">Выбрать все</button>
+            </div>
+          </div>
+
+          <!-- Master Playlist Progress Banner -->
+          <div class="playlist-master-progress" id="playlistMasterProgress" style="display: none;">
+            <div class="master-progress-header">
+              <div class="master-progress-status">
+                <span class="pulse-dot-cyan"></span>
+                <span id="masterProgressTitle" class="master-prog-title-text">Загрузка элементов плейлиста...</span>
+              </div>
+              <div class="master-progress-meta">
+                <span id="masterProgressStats" class="master-stat-val">0 / 0 скачано</span>
+                <span id="masterProgressSpeed" class="master-speed-badge">0 MB/s</span>
+              </div>
+            </div>
+            <div class="master-progress-bar-track">
+              <div class="master-progress-bar-fill" id="masterProgressBarFill" style="width: 0%;"></div>
+            </div>
+            <div class="master-progress-footer">
+              <div class="master-percent-wrap">
+                <span class="master-percent-label">Общий прогресс:</span>
+                <span id="masterProgressPercent" class="master-percent-text">0%</span>
+              </div>
+              <button type="button" class="btn-cancel-master" id="btnCancelMasterPlaylist" onclick="cancelActivePlaylistTasks()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                <span>Отменить все</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Playlist items scrollable container -->
+          <div class="playlist-items-list" id="playlistItemsList"></div>
+
+          <!-- Playlist Batch Options & Download Button -->
+          <div class="playlist-download-footer">
+            <div class="playlist-footer-header">
+              <div class="playlist-mode-toggles">
+                <label class="radio-pill active" id="pillPlaylistModeVideo">
+                  <input type="radio" name="playlistMode" value="video" checked onchange="togglePlaylistMode('video')">
+                  <span>🎬 Видео</span>
+                </label>
+                <label class="radio-pill" id="pillPlaylistModeAudio">
+                  <input type="radio" name="playlistMode" value="audio" onchange="togglePlaylistMode('audio')">
+                  <span>🎵 Музыка (Аудио)</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Video Options Panel for Playlist -->
+            <div class="playlist-options-grid" id="playlistVideoOptionsPanel">
+              <div class="form-group">
+                <label for="selectPlaylistQuality" class="form-label">
+                  <span>Качество видео:</span>
+                  <span class="label-hint">для всех выбранных видео</span>
+                </label>
+                <div class="select-wrapper">
+                  <select id="selectPlaylistQuality" class="form-select">
+                    <option value="best" selected>🌟 Максимальное доступное (Auto Best)</option>
+                    <option value="2160">4K Ultra HD (2160p)</option>
+                    <option value="1440">2K Quad HD (1440p)</option>
+                    <option value="1080">Full HD (1080p)</option>
+                    <option value="720">HD (720p)</option>
+                    <option value="480">SD (480p)</option>
+                    <option value="360">360p (Экономия места)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label for="selectPlaylistVideoFormat" class="form-label">
+                  <span>Формат видео:</span>
+                  <span class="label-hint">контейнер файла</span>
+                </label>
+                <div class="select-wrapper">
+                  <select id="selectPlaylistVideoFormat" class="form-select">
+                    <option value="mp4" selected>MP4 (универсальный для всех устройств)</option>
+                    <option value="mkv">MKV (максимальное качество потоков)</option>
+                    <option value="webm">WEBM (веб-формат)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <!-- Audio Options Panel for Playlist -->
+            <div class="playlist-options-grid" id="playlistAudioOptionsPanel" style="display: none;">
+              <div class="form-group">
+                <label for="selectPlaylistAudioFormat" class="form-label">
+                  <span>Формат аудио:</span>
+                  <span class="label-hint">расширение файла</span>
+                </label>
+                <div class="select-wrapper">
+                  <select id="selectPlaylistAudioFormat" class="form-select">
+                    <option value="mp3" selected>MP3 (наиболее совместимый)</option>
+                    <option value="m4a">M4A / AAC (высокое качество)</option>
+                    <option value="wav">WAV (без сжатия)</option>
+                    <option value="flac">FLAC (Lossless)</option>
+                    <option value="opus">OPUS (современный кодек)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label for="selectPlaylistAudioBitrate" class="form-label">
+                  <span>Битрейт звука:</span>
+                  <span class="label-hint">чем выше, тем чище</span>
+                </label>
+                <div class="select-wrapper">
+                  <select id="selectPlaylistAudioBitrate" class="form-select">
+                    <option value="320" selected>💎 320 kbps (Максимальное качество)</option>
+                    <option value="256">256 kbps (Отличное качество)</option>
+                    <option value="192">192 kbps (Стандартное)</option>
+                    <option value="128">128 kbps (Компактный размер)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div class="playlist-actions-row">
+              <button type="button" class="btn-start-download" id="btnStartBatchDownload" onclick="startBatchDownload()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                <span id="btnBatchDownloadText">Скачать выбранные (0)</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Video Details & Download Config Section -->
+      <section class="video-config-container" id="videoConfigSection" style="display: none;">
+        
+        <!-- Instagram Photo Dedicated Preview Card -->
+        <div class="photo-preview-card" id="photoPreviewCard" style="display: none;">
+          <div class="photo-preview-thumb-container">
+            <img id="photoPreviewImg" class="photo-preview-img" src="" alt="Photo Preview" />
+            <div class="photo-badge-overlay">
+              <span class="photo-badge-tag" id="photoResolutionBadge">1080 × 1350 Original</span>
+            </div>
+          </div>
+          <div class="photo-preview-details">
+            <div class="photo-meta-header">
+              <span class="photo-platform-pill">📸 INSTAGRAM PHOTO</span>
+              <span class="photo-author-tag" id="photoAuthor">@instagram</span>
+            </div>
+            <h2 class="photo-preview-title" id="photoTitle">Фото Instagram</h2>
+            <p class="photo-preview-desc" id="photoDescription">Описание...</p>
+            <div class="photo-specs-row">
+              <div class="spec-chip"><span>Формат:</span> <strong>JPG High-Res</strong></div>
+              <div class="spec-chip"><span>Качество:</span> <strong>100% Оригинал</strong></div>
+            </div>
+            <div class="photo-actions-row">
+              <button type="button" class="btn-start-download photo-download-btn" id="btnDownloadPhoto" onclick="startPhotoDownload()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                <span>Скачать фото (JPG)</span>
+              </button>
+
+              <!-- Embedded Photo Progress & Actions -->
+              <div class="photo-inline-progress" id="photoInlineProgress" style="display: none;">
+                <div class="inline-prog-header">
+                  <span class="inline-prog-pill" id="photoProgStatusPill">
+                    <span class="pulse-dot-cyan"></span>
+                    <span id="photoProgStatusText">Загрузка фото...</span>
+                  </span>
+                </div>
+                <div class="inline-prog-bar-track">
+                  <div class="inline-prog-bar-fill" id="photoProgBarFill" style="width: 0%;"></div>
+                </div>
+                <div class="inline-completed-actions" id="photoCompletedActions" style="display: none; margin-top: 10px;">
+                  <div class="inline-completed-btn-group">
+                    <button type="button" class="btn-inline-play" id="btnPhotoInlineOpen">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                      <span>Открыть фото</span>
+                    </button>
+                    <a href="#" class="btn-inline-save" id="btnPhotoInlineSave" download>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                      <span>Сохранить</span>
+                    </a>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Video Preview Card -->
+        <div class="video-preview-card" id="videoPreviewCard">
+          <div class="thumb-container">
+            <img id="videoThumb" class="video-thumb" src="" alt="Thumbnail" />
+            <div class="thumb-overlay">
+              <span class="duration-badge" id="videoDuration">00:00</span>
+            </div>
+          </div>
+          <div class="video-info-content">
+            <h2 class="video-title" id="videoTitle">Название видео</h2>
+            <div class="video-meta">
+              <span class="meta-item author" id="videoAuthor">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+                <span id="authorName">Канал</span>
+              </span>
+              <span class="meta-item views" id="videoViews">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                <span id="viewsCount">0 просмотров</span>
+              </span>
+            </div>
+            <p class="video-description" id="videoDescription">Описание видео...</p>
+            <a id="videoOriginalLink" href="#" target="_blank" rel="noopener noreferrer" class="link-original">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+              Открыть оригинал на YouTube
+            </a>
+          </div>
+        </div>
+
+        <!-- Download Options Configurator Card -->
+        <div class="config-card" id="configCard">
+          <h3 class="config-heading">Параметры скачивания</h3>
+          
+          <!-- Mode Toggle: Video vs Audio -->
+          <div class="mode-selector">
+            <button type="button" class="mode-btn active" id="btnModeVideo" onclick="setMode('video')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect><line x1="7" y1="2" x2="7" y2="22"></line><line x1="17" y1="2" x2="17" y2="22"></line><line x1="2" y1="12" x2="22" y2="12"></line><line x1="2" y1="7" x2="7" y2="7"></line><line x1="2" y1="17" x2="7" y2="17"></line><line x1="17" y1="17" x2="22" y2="17"></line><line x1="17" y1="7" x2="22" y2="7"></line></svg>
+              <span>Видео со звуком</span>
+            </button>
+            <button type="button" class="mode-btn" id="btnModeAudio" onclick="setMode('audio')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>
+              <span>Только аудио (MP3 / Музыка)</span>
+            </button>
+          </div>
+
+          <!-- Video Options Panel -->
+          <div class="options-grid" id="videoOptionsPanel">
+            <div class="form-group">
+              <label for="selectQuality" class="form-label">
+                <span>Качество видео:</span>
+                <span class="label-hint">авто-выбор лучшего или фиксированное</span>
+              </label>
+              <div class="select-wrapper">
+                <select id="selectQuality" class="form-select">
+                  <option value="best" selected>🌟 Максимальное доступное (Auto Best)</option>
+                  <!-- Populated dynamically based on video streams -->
+                </select>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label for="selectVideoFormat" class="form-label">
+                <span>Формат видео:</span>
+                <span class="label-hint">контейнер файла</span>
+              </label>
+              <div class="select-wrapper">
+                <select id="selectVideoFormat" class="form-select">
+                  <option value="mp4" selected>MP4 (универсальный для всех устройств)</option>
+                  <option value="mkv">MKV (максимальное качество потоков)</option>
+                  <option value="webm">WEBM (современный веб-формат)</option>
+                  <option value="gif">GIF (анимированная гифка / стикер)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <!-- Audio Options Panel -->
+          <div class="options-grid" id="audioOptionsPanel" style="display: none;">
+            <div class="form-group">
+              <label for="selectAudioFormat" class="form-label">
+                <span>Формат аудио:</span>
+                <span class="label-hint">расширение файла</span>
+              </label>
+              <div class="select-wrapper">
+                <select id="selectAudioFormat" class="form-select">
+                  <option value="mp3" selected>MP3 (наиболее совместимый)</option>
+                  <option value="m4a">M4A / AAC (высокое качество Apple / Android)</option>
+                  <option value="wav">WAV (без потери качества, без сжатия)</option>
+                  <option value="flac">FLAC (Lossless сжатие без потерь)</option>
+                  <option value="opus">OPUS (современный аудиокодек)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label for="selectAudioBitrate" class="form-label">
+                <span>Битрейт / Качество звука:</span>
+                <span class="label-hint">чем выше, тем чище звук</span>
+              </label>
+              <div class="select-wrapper">
+                <select id="selectAudioBitrate" class="form-select">
+                  <option value="320" selected>💎 320 kbps (Максимальное качество)</option>
+                  <option value="256">256 kbps (Отличное качество)</option>
+                  <option value="192">192 kbps (Стандартное качество)</option>
+                  <option value="128">128 kbps (Компактный размер)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <!-- Advanced Accordion Settings (Trim, Chapters, Subtitles, Metadata) -->
+          <div class="advanced-section">
+            
+            <!-- Tool 1: Trim Video / Audio & Chapters -->
+            <div class="accordion-item" id="accordionTrim">
+              <div class="accordion-header" onclick="toggleAccordion('trim')">
+                <div class="accordion-title">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><line x1="20" y1="4" x2="8.12" y2="15.88"></line><line x1="14.47" y1="14.48" x2="20" y2="20"></line><line x1="8.12" y1="8.12" x2="12" y2="12"></line></svg>
+                  <span>Обрезать фрагмент и Главы (таймкоды)</span>
+                </div>
+                <div class="accordion-status">
+                  <span class="tag-status" id="trimStatusTag">Выключено</span>
+                  <svg class="chevron-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </div>
+              </div>
+              <div class="accordion-body" id="trimBody">
+                <!-- Chapters Dropdown if chapters exist -->
+                <div class="form-group" id="chaptersDropdownContainer" style="display: none; margin-bottom: 14px;">
+                  <label for="selectChapter" class="form-label">
+                    <span>Быстрый выбор главы видео:</span>
+                  </label>
+                  <div class="select-wrapper">
+                    <select id="selectChapter" class="form-select" onchange="handleChapterSelect(this.value)">
+                      <option value="">Выберите главу для авто-подстановки таймкода...</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="trim-inputs">
+                  <div class="form-group">
+                    <label for="trimStart">Начало (ЧЧ:ММ:СС):</label>
+                    <input type="text" id="trimStart" class="form-input" placeholder="00:00:00" />
+                  </div>
+                  <div class="form-group">
+                    <label for="trimEnd">Конец (ЧЧ:ММ:СС):</label>
+                    <input type="text" id="trimEnd" class="form-input" placeholder="00:01:30" />
+                  </div>
+                </div>
+                <div class="trim-actions">
+                  <button type="button" class="btn-secondary-sm" onclick="setTrimFull()">Сбросить на всё видео</button>
+                  <span class="trim-hint">💡 Скачивает только указанный кусок без лишнего трафика</span>
+                </div>
+
+                <label class="custom-checkbox" style="margin-top: 14px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 12px;">
+                  <input type="checkbox" id="checkSplitChapters">
+                  <span class="checkbox-mark"></span>
+                  <span class="checkbox-text">Разделить всё видео на файлы по главам (--split-chapters)</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Tool 2: Subtitles -->
+            <div class="accordion-item" id="accordionSubs">
+              <div class="accordion-header" onclick="toggleAccordion('subs')">
+                <div class="accordion-title">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                  <span>Субтитры</span>
+                </div>
+                <div class="accordion-status">
+                  <span class="tag-status" id="subsStatusTag">Нет</span>
+                  <svg class="chevron-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </div>
+              </div>
+              <div class="accordion-body" id="subsBody">
+                <label class="custom-checkbox">
+                  <input type="checkbox" id="checkEnableSubs" onchange="updateSubsState()">
+                  <span class="checkbox-mark"></span>
+                  <span class="checkbox-text">Скачивать субтитры вместе с видео</span>
+                </label>
+
+                <div id="subsOptionsContainer" style="display: none; margin-top: 14px;">
+                  <div class="form-group">
+                    <label for="selectSubLang" class="form-label">Язык субтитров:</label>
+                    <select id="selectSubLang" class="form-select">
+                      <option value="ru">Русский (ru)</option>
+                      <option value="en">English (en)</option>
+                    </select>
+                  </div>
+
+                  <label class="custom-checkbox" style="margin-top: 10px;">
+                    <input type="checkbox" id="checkEmbedSubs">
+                    <span class="checkbox-mark"></span>
+                    <span class="checkbox-text">Вшить субтитры прямо в видеофайл (для плееров с CC)</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tool 3: Embed Thumbnail & Metadata -->
+            <div class="extra-toggles">
+              <label class="custom-checkbox">
+                <input type="checkbox" id="checkEmbedThumb" checked>
+                <span class="checkbox-mark"></span>
+                <span class="checkbox-text">Вшивать обложку и метаданные (ID3-теги, исполнитель, постер)</span>
+              </label>
+            </div>
+
+          </div>
+
+          <!-- Submit Button & Embedded In-Card Progress -->
+          <div class="action-footer">
+            <button type="button" class="btn-start-download" id="btnStartDownload" onclick="startDownloadProcess()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+              <span id="btnDownloadText">Скачать сейчас</span>
+            </button>
+
+            <!-- Embedded Live Progress Deck (in-card) -->
+            <div class="single-inline-progress" id="singleInlineProgress" style="display: none;">
+              <div class="inline-prog-header">
+                <div class="inline-prog-title-wrap">
+                  <span class="inline-prog-pill" id="singleProgStatusPill">
+                    <span class="pulse-dot-cyan"></span>
+                    <span id="singleProgStatusText">Подготовка к скачиванию...</span>
+                  </span>
+                  <span class="inline-prog-format-tag" id="singleProgFormatTag">1080p MP4</span>
+                </div>
+                <button type="button" class="btn-cancel-inline" id="btnSingleCancel" onclick="cancelCurrentSingleTask()">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                  <span>Отменить</span>
+                </button>
+              </div>
+
+              <div class="inline-prog-bar-track">
+                <div class="inline-prog-bar-fill" id="singleProgBarFill" style="width: 0%;"></div>
+              </div>
+
+              <div class="inline-prog-stats-grid">
+                <div class="inline-stat-box">
+                  <span class="inline-stat-lbl">Прогресс</span>
+                  <strong class="inline-stat-num highlight" id="singleProgPct">0%</strong>
+                </div>
+                <div class="inline-stat-box">
+                  <span class="inline-stat-lbl">Скачано</span>
+                  <strong class="inline-stat-num" id="singleProgDownloaded">0 B</strong>
+                </div>
+                <div class="inline-stat-box">
+                  <span class="inline-stat-lbl">Скорость</span>
+                  <strong class="inline-stat-num" id="singleProgSpeed">--</strong>
+                </div>
+                <div class="inline-stat-box">
+                  <span class="inline-stat-lbl">Осталось</span>
+                  <strong class="inline-stat-num" id="singleProgEta">--</strong>
+                </div>
+              </div>
+
+              <!-- Inline Completion Actions Hub -->
+              <div class="inline-completed-actions" id="singleProgCompletedActions" style="display: none;">
+                <div class="inline-completed-banner">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+                  <span>Файл успешно скачан и сохранен в «Моих файлах»!</span>
+                </div>
+                <div class="inline-completed-btn-group">
+                  <button type="button" class="btn-inline-play" id="btnSingleInlinePlay">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                    <span>Воспроизвести</span>
+                  </button>
+                  <a href="#" class="btn-inline-save" id="btnSingleInlineSave" download>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                    <span>Сохранить на компьютер</span>
+                  </a>
+                  <button type="button" class="btn-inline-history" onclick="switchMainTab('history')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                    <span>Мои файлы</span>
+                  </button>
+                  <button type="button" class="btn-inline-restart" onclick="resetSingleInlineProgress()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg>
+                    <span>Скачать снова</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+    </main>
+
+    <!-- TAB 2: History & Downloaded Files (YouTube Media Library) -->
+    <main class="tab-content" id="tabHistory" style="display: none;">
+      <section class="history-card">
+        <div class="history-header">
+          <div class="history-header-info">
+            <h2 class="history-title">Мои файлы</h2>
+            <p class="history-subtitle" id="historySubtitle">Все скачанные видео и аудио хранятся локально на сервере</p>
+          </div>
+          <div class="history-header-actions">
+            <button type="button" class="btn-open-folder" id="btnOpenFolder" onclick="openDownloadsFolder()" title="Показать папку с загрузками в Finder на Mac">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+              <span>Открыть папку</span>
+            </button>
+            <button type="button" class="btn-multi-toggle" id="btnToggleMultiSelect" onclick="toggleMultiSelectMode()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"></polyline><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+              <span id="multiToggleText">Выбрать файлы</span>
+            </button>
+            <button type="button" class="btn-refresh" onclick="loadHistoryFiles()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+              <span>Обновить</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- YouTube Media Library Toolbar -->
+        <div class="history-toolbar">
+          <div class="history-search-box">
+            <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;min-width:16px;max-width:16px;flex-shrink:0;"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+            <input type="text" id="historySearchInput" class="history-search-input" placeholder="Поиск по названию или качеству..." oninput="handleHistorySearch(this.value)">
+            <button type="button" class="btn-clear-search" id="btnClearSearch" style="display:none;" onclick="clearHistorySearch()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;min-width:14px;max-width:14px;display:block;"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+          </div>
+
+          <!-- Sort dropdown -->
+          <div class="history-sort-box">
+            <label for="historySortSelect" class="sort-label">Сортировка:</label>
+            <div class="sort-select-wrapper">
+              <select id="historySortSelect" class="form-select sort-select" onchange="handleHistorySortChange(this.value)">
+                <option value="date-desc">Сначала новые</option>
+                <option value="date-asc">Сначала старые</option>
+                <option value="size-desc">По размеру (убыв.)</option>
+                <option value="size-asc">По размеру (возр.)</option>
+                <option value="duration-desc">По длительности (длинные)</option>
+                <option value="duration-asc">По длительности (короткие)</option>
+                <option value="title-asc">По названию (А-Я)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="history-filters-group">
+            <button type="button" class="history-filter-pill active" id="filterPillAll" onclick="setHistoryFilter('all')">
+              <span>Все файлы</span> <span class="pill-count" id="countAll">0</span>
+            </button>
+            <button type="button" class="history-filter-pill" id="filterPillPlaylists" onclick="setHistoryFilter('playlists')">
+              <span>📁 Плейлисты</span> <span class="pill-count" id="countPlaylists">0</span>
+            </button>
+            <button type="button" class="history-filter-pill" id="filterPillVideo" onclick="setHistoryFilter('video')">
+              <span>Видео</span> <span class="pill-count" id="countVideos">0</span>
+            </button>
+            <button type="button" class="history-filter-pill" id="filterPillAudio" onclick="setHistoryFilter('audio')">
+              <span>Аудио</span> <span class="pill-count" id="countAudio">0</span>
+            </button>
+            <button type="button" class="history-filter-pill" id="filterPillPhotos" onclick="setHistoryFilter('photo')">
+              <span>📸 Фото</span> <span class="pill-count" id="countPhotos">0</span>
+            </button>
+          </div>
+
+          <div class="history-view-toggles">
+            <button type="button" class="btn-view-toggle active" id="btnViewGrid" title="Сетка (в стиле YouTube)" onclick="setHistoryViewMode('grid')">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;min-width:16px;max-width:16px;display:block;"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+            </button>
+            <button type="button" class="btn-view-toggle" id="btnViewList" title="Список" onclick="setHistoryViewMode('list')">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;min-width:16px;max-width:16px;display:block;"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="history-table-container">
+          <!-- Playlist Detail View Banner with cover image -->
+          <div class="playlist-view-banner" id="playlistViewBanner" style="display: none;">
+            <div class="playlist-banner-left">
+              <button type="button" class="btn-back-to-all" onclick="exitPlaylistView()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+                <span>Назад</span>
+              </button>
+              <div class="playlist-banner-cover-wrapper">
+                <img id="playlistBannerCoverImg" class="playlist-banner-cover-img" src="" alt="Cover" onerror="this.style.opacity='0.4'" />
+              </div>
+              <div class="playlist-banner-info">
+                <span class="playlist-pill-tag">📁 ПЛЕЙЛИСТ</span>
+                <h3 class="playlist-banner-title" id="playlistBannerTitle">Название плейлиста</h3>
+                <div class="playlist-banner-stats" id="playlistBannerStats">14 видео • 634 MB</div>
+              </div>
+            </div>
+            <div class="playlist-banner-actions">
+              <button type="button" class="btn-pl-banner-action play-all" id="btnPlayAllPlaylist" onclick="playAllCurrentPlaylist()" title="Воспроизвести все по очереди">
+                <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                <span>Смотреть все</span>
+              </button>
+              <button type="button" class="btn-pl-banner-action" onclick="openCurrentPlaylistFolder()" title="Показать папку в Finder на Mac">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                <span>Finder</span>
+              </button>
+              <button type="button" class="btn-pl-banner-action" onclick="downloadCurrentPlaylistZip()" title="Скачать ZIP архивом">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                <span>ZIP</span>
+              </button>
+              <button type="button" class="btn-pl-banner-action danger" onclick="deleteCurrentPlaylist()" title="Удалить весь плейлист">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                <span>Удалить</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="historyLoading" class="history-loading">
+            <div class="loader-spinner-sm"></div>
+            <span>Загрузка превью и медиафайлов...</span>
+          </div>
+
+          <div id="historyEmpty" class="history-empty" style="display: none;">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+            <h3 id="historyEmptyTitle">Пока нет скачанных файлов</h3>
+            <p id="historyEmptyDesc">Вставьте ссылку на видео на вкладке «Загрузчик», чтобы начать скачивание.</p>
+            <button type="button" class="btn-secondary" id="btnGoToDownloader" onclick="switchMainTab('downloader')">Перейти к скачиванию</button>
+          </div>
+
+          <div class="yt-cards-grid" id="filesList">
+            <!-- Populated dynamically with YouTube-style cards -->
+          </div>
+        </div>
+
+        <!-- Floating Multi-select Action Bar -->
+        <div class="multi-action-bar" id="multiActionBar" style="display: none;">
+          <div class="multi-action-info">
+            <span class="multi-selected-count" id="multiSelectedCount">Выбрано: 0 файлов</span>
+            <button type="button" class="btn-text-action" onclick="selectAllHistoryFiles()">Выбрать все</button>
+            <button type="button" class="btn-text-action" onclick="deselectAllHistoryFiles()">Снять выбор</button>
+          </div>
+          <div class="multi-action-buttons">
+            <button type="button" class="btn-multi-zip" onclick="batchDownloadZip()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+              <span>Скачать ZIP архивом</span>
+            </button>
+            <button type="button" class="btn-multi-delete" onclick="batchDeleteSelected()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+              <span>Удалить выбранные</span>
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Media Player Modal -->
+    <div class="modal-backdrop" id="playerModal" style="display: none;" onclick="closePlayerModal(event)">
+      <div class="modal-dialog" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3 class="modal-title" id="modalPlayerTitle">Воспроизведение</h3>
+          <div class="modal-header-badges">
+            <span class="modal-badge-playlist" id="modalPlaylistBadge" style="display: none;"></span>
+            <span class="modal-badge-subs" id="modalSubsBadge" style="display: none;">CC Субтитры доступны</span>
+          </div>
+          <button type="button" class="btn-modal-close" onclick="closePlayerModal()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          </button>
+        </div>
+        <div class="modal-player-body">
+          <video id="modalVideoPlayer" controls playsinline crossorigin="anonymous" style="display: none;"></video>
+          <audio id="modalAudioPlayer" controls style="display: none;"></audio>
+        </div>
+        <div class="modal-playlist-nav" id="modalPlaylistNav" style="display: none;">
+          <button type="button" class="btn-pl-nav" id="btnPlayerPrev" onclick="playPrevInPlaylist()" title="Предыдущее видео">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="19 20 9 12 19 4 19 20"></polygon><line x1="5" y1="19" x2="5" y2="5"></line></svg>
+            <span>Предыдущее</span>
+          </button>
+          <span class="pl-nav-counter" id="plNavCounter">1 / 1</span>
+          <button type="button" class="btn-pl-nav" id="btnPlayerNext" onclick="playNextInPlaylist()" title="Следующее видео">
+            <span>Следующее</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 4 15 12 5 20 5 4"></polygon><line x1="19" y1="5" x2="19" y2="19"></line></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Photo Lightbox Modal -->
+    <div class="modal-backdrop" id="lightboxModal" style="display: none;" onclick="closeLightboxModal(event)">
+      <div class="lightbox-dialog" onclick="event.stopPropagation()">
+        <div class="lightbox-header">
+          <div class="lightbox-title-group">
+            <span class="lightbox-badge">📸 Фото</span>
+            <h3 class="lightbox-title" id="lightboxTitle">Фотография</h3>
+            <span class="lightbox-counter" id="lightboxCounter" style="display: none;">1 / 1</span>
+          </div>
+          <div class="lightbox-actions-top">
+            <a id="lightboxDownloadBtn" href="#" download class="btn-lightbox-download" title="Скачать оригинал">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+              <span>Скачать</span>
+            </a>
+            <button type="button" class="btn-modal-close" onclick="closeLightboxModal()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+          </div>
+        </div>
+        <div class="lightbox-body">
+          <button type="button" class="lightbox-nav-btn prev" id="btnLightboxPrev" onclick="showPrevPhoto()" title="Предыдущее фото (←)" style="display: none;">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"></polyline></svg>
+          </button>
+          <img id="lightboxImg" class="lightbox-image" src="" alt="Full resolution photo" />
+          <button type="button" class="lightbox-nav-btn next" id="btnLightboxNext" onclick="showNextPhoto()" title="Следующее фото (→)" style="display: none;">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
+          </button>
+        </div>
+        <div class="lightbox-footer">
+          <div class="lightbox-footer-info">
+            <span class="lightbox-meta-item" id="lightboxMetaSize">0 MB</span>
+            <span class="lightbox-meta-item" id="lightboxMetaRes">1080 × 1350</span>
+          </div>
+          <button type="button" class="btn-lightbox-finder" id="lightboxFinderBtn" onclick="revealCurrentLightboxInFinder()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+            <span>Показать в Finder</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Floating Downloads Drawer (Safari / Arc style) -->
+    <div class="downloads-drawer-overlay" id="downloadsDrawerOverlay" onclick="closeDownloadsDrawer()"></div>
+    <aside class="downloads-drawer" id="downloadsDrawer" aria-label="Очередь загрузок">
+      <div class="drawer-header">
+        <div class="drawer-header-info">
+          <div class="drawer-header-title">
+            <svg class="drawer-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            <h3>Очередь загрузок</h3>
+          </div>
+          <span class="drawer-status-subtitle" id="drawerStatusSubtitle">Все завершены</span>
+        </div>
+        <div class="drawer-header-actions">
+          <button type="button" class="btn-drawer-clear" id="btnClearFinishedQueue" onclick="clearFinishedTasks()" title="Очистить завершённые">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+            <span>Очистить</span>
+          </button>
+          <button type="button" class="btn-drawer-close" onclick="closeDownloadsDrawer()" title="Закрыть (Esc)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="drawer-body" id="drawerBody">
+        <!-- Empty State -->
+        <div class="drawer-empty-state" id="drawerEmptyState" style="display: none;">
+          <div class="drawer-empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+          </div>
+          <p class="drawer-empty-title">Нет активных загрузок</p>
+          <p class="drawer-empty-desc">Здесь будут отображаться скачиваемые файлы, плейлисты и их статус</p>
+        </div>
+
+        <!-- Compact Task Rows List -->
+        <div class="drawer-task-list" id="queueList"></div>
+      </div>
+    </aside>
+
+    <!-- Task Logs Modal (yt-dlp & ffmpeg detailed log) -->
+    <div class="modal-backdrop task-logs-backdrop" id="taskLogsModal" style="display: none;" onclick="if(event.target===this) closeTaskLogsModal()">
+      <div class="modal-dialog logs-modal-dialog" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <div class="modal-title-group">
+            <div class="modal-terminal-badge">
+              <svg class="modal-terminal-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polyline points="4 17 10 11 4 5"></polyline>
+                <line x1="12" y1="19" x2="20" y2="19"></line>
+              </svg>
+            </div>
+            <div class="modal-title-text-wrap">
+              <h3 class="modal-title" id="logsModalTitle">Системный лог процесса</h3>
+              <span class="modal-title-sub" id="logsModalSub">Вывод yt-dlp & FFmpeg в реальном времени</span>
+            </div>
+          </div>
+          <div class="modal-header-actions">
+            <button type="button" class="btn-copy-logs" id="btnCopyTaskLogs" onclick="copyTaskLogs()" title="Скопировать лог">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              <span>Копировать</span>
+            </button>
+            <button type="button" class="btn-modal-close" onclick="closeTaskLogsModal()" title="Закрыть (Esc)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+          </div>
+        </div>
+        <div class="modal-body logs-modal-body">
+          <pre class="terminal-log-pre" id="taskLogsPre"></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Unified Auth Modal (Login / Register) -->
+    <div class="modal-backdrop" id="authModal" style="display: none;" onclick="if(event.target===this) closeAuthModal()">
+      <div class="modal-dialog auth-modal-dialog" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <div class="modal-title-group">
+            <div class="modal-terminal-badge" id="authModalBadge">
+              🔐
+            </div>
+            <div class="modal-title-text-wrap">
+              <h3 class="modal-title" id="authModalTitle">Авторизация</h3>
+              <span class="modal-title-sub">MediaPull &bull; Личный доступ</span>
+            </div>
+          </div>
+          <button type="button" class="btn-modal-close" onclick="closeAuthModal()" title="Закрыть">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          </button>
+        </div>
+
+        <div class="modal-tabs-header">
+          <button type="button" class="modal-tab-btn active" id="tabBtnLogin" onclick="switchAuthTab('login')">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+            Вход
+          </button>
+          <button type="button" class="modal-tab-btn" id="tabBtnRegister" onclick="switchAuthTab('register')">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+            Регистрация
+          </button>
+        </div>
+
+        <!-- Login Form -->
+        <div class="modal-body" id="authLoginForm" style="padding: 22px;">
+          <div class="form-group" style="margin-bottom: 14px;">
+            <label style="display: block; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px;">Логин (или оставьте пустым для kexiky):</label>
+            <input type="text" id="loginUsernameInput" class="custom-input" placeholder="Логин (например, alex)..." style="width: 100%;" onkeydown="if(event.key==='Enter') submitLogin()">
+          </div>
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label style="display: block; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px;">Пароль:</label>
+            <input type="password" id="loginPasswordInput" class="custom-input" placeholder="Пароль..." style="width: 100%;" onkeydown="if(event.key==='Enter') submitLogin()">
+          </div>
+          <p id="loginErrorMsg" style="display: none; color: #ff453a; font-size: 0.85rem; margin-bottom: 14px; font-weight: 500;"></p>
+          <div style="display: flex; justify-content: flex-end; gap: 10px;">
+            <button type="button" class="btn-modal-cancel" onclick="closeAuthModal()">Отмена</button>
+            <button type="button" class="btn-download-main" id="btnSubmitLogin" onclick="submitLogin()">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+              <span>Войти</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Register Form -->
+        <div class="modal-body" id="authRegisterForm" style="display: none; padding: 22px;">
+          <div style="background: rgba(0, 210, 255, 0.08); border: 1px solid rgba(0, 210, 255, 0.25); border-radius: var(--radius-md); padding: 12px; margin-bottom: 14px; font-size: 0.82rem; color: #00d2ff; line-height: 1.4;">
+            ✨ <strong>Преимущества регистрации:</strong> Личное хранилище 10 ГБ и сохранение файлов на 7 дней (вместо 24 часов для гостей).
+          </div>
+          <div class="form-group" style="margin-bottom: 14px;">
+            <label style="display: block; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px;">Придумайте логин:</label>
+            <input type="text" id="regUsernameInput" class="custom-input" placeholder="Логин (от 3 латинских символов)..." style="width: 100%;" onkeydown="if(event.key==='Enter') submitRegister()">
+          </div>
+          <div class="form-group" style="margin-bottom: 14px;">
+            <label style="display: block; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px;">Пароль:</label>
+            <input type="password" id="regPasswordInput" class="custom-input" placeholder="Пароль (от 4 символов)..." style="width: 100%;" onkeydown="if(event.key==='Enter') submitRegister()">
+          </div>
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label style="display: block; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px;">Повторите пароль:</label>
+            <input type="password" id="regPasswordConfirmInput" class="custom-input" placeholder="Повторите пароль..." style="width: 100%;" onkeydown="if(event.key==='Enter') submitRegister()">
+          </div>
+          <p id="regErrorMsg" style="display: none; color: #ff453a; font-size: 0.85rem; margin-bottom: 14px; font-weight: 500;"></p>
+          <div style="display: flex; justify-content: flex-end; gap: 10px;">
+            <button type="button" class="btn-modal-cancel" onclick="closeAuthModal()">Отмена</button>
+            <button type="button" class="btn-download-main" id="btnSubmitRegister" onclick="submitRegister()">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+              <span>Создать аккаунт</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Personal Cabinet Modal -->
+    <div class="modal-backdrop" id="cabinetModal" style="display: none;" onclick="if(event.target===this) closeCabinetModal()">
+      <div class="modal-dialog cabinet-modal-dialog" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <div class="modal-title-group">
+            <div class="modal-terminal-badge" id="cabinetHeaderBadge">
+              👤
+            </div>
+            <div class="modal-title-text-wrap">
+              <h3 class="modal-title">Личный кабинет</h3>
+              <span class="modal-title-sub">Управление профилем и хранилищем</span>
+            </div>
+          </div>
+          <button type="button" class="btn-modal-close" onclick="closeCabinetModal()" title="Закрыть">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          </button>
+        </div>
+
+        <div class="modal-tabs-header">
+          <button type="button" class="modal-tab-btn active" id="tabBtnCabStorage" onclick="switchCabinetTab('storage')">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+            <span>Мое хранилище</span>
+          </button>
+          <button type="button" class="modal-tab-btn" id="tabBtnCabSecurity" onclick="switchCabinetTab('security')">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            <span>Безопасность</span>
+          </button>
+          <button type="button" class="modal-tab-btn" id="tabBtnCabAdmin" style="display: none;" onclick="switchCabinetTab('admin')">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            <span>Админ-панель</span>
+          </button>
+        </div>
+
+        <div class="modal-body" style="padding: 22px;">
+          <!-- Profile Badge Card (Always Visible) -->
+          <div class="cabinet-profile-card">
+            <div class="cabinet-avatar-wrap" id="cabinetAvatarIcon">👑</div>
+            <div class="cabinet-info-wrap">
+              <div class="cabinet-username-row">
+                <span class="cabinet-username-text" id="cabinetUsernameText">kexiky</span>
+                <span class="role-badge admin" id="cabinetRoleBadge">Создатель / Админ</span>
+              </div>
+              <div class="cabinet-reg-date" id="cabinetRegDateText">Регистрация: бессрочный аккаунт</div>
+            </div>
+            <button type="button" class="btn-cabinet-logout" onclick="submitLogout()" title="Выйти из аккаунта">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+              <span>Выйти</span>
+            </button>
+          </div>
+
+          <!-- Tab 1: Storage -->
+          <div id="cabTabContentStorage">
+            <div class="quota-card">
+              <div class="quota-header-row">
+                <span class="quota-title">Дисковая квота</span>
+                <span class="quota-value" id="cabinetQuotaText">0 B / 10 ГБ (0%)</span>
+              </div>
+              <div class="quota-progress-track">
+                <div class="quota-progress-fill" id="cabinetQuotaBar" style="width: 0%;"></div>
+              </div>
+            </div>
+
+            <div class="cabinet-metrics-grid">
+              <div class="cabinet-metric-item">
+                <div class="cabinet-metric-label">Срок хранения файлов</div>
+                <div class="cabinet-metric-value" id="cabinetMetricTtl">♾️ Вечно</div>
+              </div>
+              <div class="cabinet-metric-item">
+                <div class="cabinet-metric-label">Всего файлов на диске</div>
+                <div class="cabinet-metric-value" id="cabinetMetricFiles">0</div>
+              </div>
+              <div class="cabinet-metric-item">
+                <div class="cabinet-metric-label">Занято места</div>
+                <div class="cabinet-metric-value" id="cabinetMetricSize">0 B</div>
+              </div>
+              <div class="cabinet-metric-item">
+                <div class="cabinet-metric-label">Макс. качество видео</div>
+                <div class="cabinet-metric-value" id="cabinetMetricQuality">до 8K</div>
+              </div>
+            </div>
+
+            <!-- Cabinet Theme Setting Section -->
+            <div class="cabinet-theme-section">
+              <div class="cabinet-section-title-row">
+                <div class="cabinet-section-title-left">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 0 0 20z"/></svg>
+                  <span class="cabinet-theme-title">Тема и оформление</span>
+                </div>
+                <div class="cabinet-mode-switch">
+                  <button type="button" class="btn-cab-mode active" id="cabModeBtnDark" onclick="setAppMode('dark')">🌙 Тёмная</button>
+                  <button type="button" class="btn-cab-mode" id="cabModeBtnLight" onclick="setAppMode('light')">☀️ Светлая</button>
+                </div>
+              </div>
+              <div class="cabinet-theme-pills">
+                <button type="button" class="cabinet-theme-pill active" data-cab-theme="cyan" onclick="setAppTheme('cyan')">
+                  <span class="pill-dot" style="background: #00d2ff;"></span>
+                  <span>Electric Cyan</span>
+                </button>
+                <button type="button" class="cabinet-theme-pill" data-cab-theme="monochrome" onclick="setAppTheme('monochrome')">
+                  <span class="pill-dot" style="background: #ffffff; border: 1px solid #64748b;"></span>
+                  <span>Monochrome</span>
+                </button>
+                <button type="button" class="cabinet-theme-pill" data-cab-theme="indigo" onclick="setAppTheme('indigo')">
+                  <span class="pill-dot" style="background: #6366f1;"></span>
+                  <span>Nordic Indigo</span>
+                </button>
+                <button type="button" class="cabinet-theme-pill" data-cab-theme="emerald" onclick="setAppTheme('emerald')">
+                  <span class="pill-dot" style="background: #10b981;"></span>
+                  <span>Cyber Emerald</span>
+                </button>
+                <button type="button" class="cabinet-theme-pill" data-cab-theme="crimson" onclick="setAppTheme('crimson')">
+                  <span class="pill-dot" style="background: #ff0033;"></span>
+                  <span>Crimson Classic</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab 2: Security -->
+          <div id="cabTabContentSecurity" style="display: none;">
+            <h4 class="cabinet-section-title">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              <span>Смена пароля</span>
+            </h4>
+            <div class="form-group" style="margin-bottom: 12px;">
+              <label class="cabinet-form-label">Текущий пароль:</label>
+              <input type="password" id="cabOldPassInput" class="custom-input" placeholder="Введите текущий пароль...">
+            </div>
+            <div class="form-group" style="margin-bottom: 14px;">
+              <label class="cabinet-form-label">Новый пароль:</label>
+              <input type="password" id="cabNewPassInput" class="custom-input" placeholder="Новый пароль (от 4 символов)...">
+            </div>
+            <p id="cabPassErrorMsg" style="display: none; color: #ff453a; font-size: 0.85rem; margin-bottom: 12px; font-weight: 500;"></p>
+            <p id="cabPassSuccessMsg" style="display: none; color: #30d158; font-size: 0.85rem; margin-bottom: 12px; font-weight: 500;"></p>
+            <div style="display: flex; justify-content: flex-end; margin-bottom: 22px;">
+              <button type="button" class="btn-cabinet-submit" onclick="submitChangePassword()">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                <span>Обновить пароль</span>
+              </button>
+            </div>
+
+            <hr style="border: none; border-top: 1px solid rgba(255, 255, 255, 0.08); margin-bottom: 18px;">
+
+            <h4 class="cabinet-section-title">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M14.31 8l5.74 9.94M9.69 8h11.48M7.38 12l5.74-9.94M9.69 16L3.95 6.06M14.31 16H2.83M16.62 12l-5.74 9.94"/></svg>
+              <span>API Токен доступа</span>
+            </h4>
+            <p class="cabinet-form-desc">Используется для быстрой интеграции с Telegram-ботом или внешними утилитами скачивания:</p>
+            <div class="cabinet-token-box">
+              <input type="text" id="cabApiTokenInput" class="custom-input" readonly value="">
+              <button type="button" class="btn-cabinet-copy" id="btnCopyApiToken" onclick="copyApiToken()">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                <span>Копировать</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Tab 3: Admin Panel (Admin Only) -->
+          <div id="cabTabContentAdmin" style="display: none;">
+            <div class="admin-stats-row">
+              <div class="admin-stat-card">
+                <div class="admin-stat-title">Диск сервера</div>
+                <div class="admin-stat-val" id="adminStatDiskFree">--</div>
+              </div>
+              <div class="admin-stat-card">
+                <div class="admin-stat-title">Размер БД</div>
+                <div class="admin-stat-val" id="adminStatDbSize">--</div>
+              </div>
+              <div class="admin-stat-card">
+                <div class="admin-stat-title">Пользователей</div>
+                <div class="admin-stat-val" id="adminStatUsersCount">--</div>
+              </div>
+            </div>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+              <span class="cabinet-section-title" style="margin-bottom: 0;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                <span>Управление пользователями</span>
+              </span>
+              <button type="button" class="btn-admin-cleanup" onclick="triggerAdminCleanup()" title="Очистить файлы с истекшим TTL">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                <span>Очистить мусор</span>
+              </button>
+            </div>
+
+            <div class="admin-table-wrap">
+              <table class="admin-table">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Логин</th>
+                    <th>Роль</th>
+                    <th>Хранилище</th>
+                    <th style="text-align: right;">Действия</th>
+                  </tr>
+                </thead>
+                <tbody id="adminUsersTableBody">
+                  <!-- Dynamically populated -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notification Container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <p>MediaPull &bull; Universal Media Downloader by Kexiky &bull; 4K &bull; Multiplatform &bull; FFmpeg</p>
+    </footer>
+
+  </div>
+
+  <script src="app.js?v=20260918_v2"></script>
+</body>
+</html>
