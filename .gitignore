@@ -22,8 +22,8 @@ assets/
 *.db
 *.sqlite
 *.sqlite3
-data/*.db
-data/*.sqlite3
+data/
+!data/.gitkeep
 
 # Operating System & Agent artifacts
 .DS_Store
