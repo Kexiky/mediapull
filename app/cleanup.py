@@ -13,6 +13,9 @@ USER_TTL_SECONDS = 7 * 86400   # 7 days
 PREMIUM_TTL_SECONDS = 30 * 86400 # 30 days
 
 
+import hashlib
+
+
 def _clean_directory_by_ttl(target_dir: Path, ttl_seconds: int, now: float) -> tuple[int, int]:
     """Recursively clean files older than ttl_seconds in target_dir."""
     if not target_dir.exists() or not target_dir.is_dir():
@@ -20,6 +23,7 @@ def _clean_directory_by_ttl(target_dir: Path, ttl_seconds: int, now: float) -> t
 
     deleted_count = 0
     freed_bytes = 0
+    user_prefix = target_dir.name
 
     for file_path in list(target_dir.rglob("*")):
         if not file_path.is_file() or file_path.name.startswith("."):
@@ -30,16 +34,18 @@ def _clean_directory_by_ttl(target_dir: Path, ttl_seconds: int, now: float) -> t
             file_age = now - st.st_mtime
             if file_age >= ttl_seconds:
                 f_size = st.st_size
+                rel_str = str(file_path.relative_to(target_dir))
                 file_path.unlink(missing_ok=True)
                 deleted_count += 1
                 freed_bytes += f_size
 
-                # Remove matching thumbnail in .thumbnails if exists
+                # Remove matching thumbnails in .thumbnails (MD5 hashed keys)
                 try:
-                    thumb_name = file_path.name + ".jpg"
-                    thumb_path = THUMBNAILS_DIR / thumb_name
-                    if thumb_path.exists():
-                        thumb_path.unlink(missing_ok=True)
+                    k1 = hashlib.md5(f"{user_prefix}:{rel_str.strip('/\\')}".encode("utf-8")).hexdigest()
+                    k2 = hashlib.md5(rel_str.strip('/\\').encode("utf-8")).hexdigest()
+                    k3 = hashlib.md5(file_path.name.encode("utf-8")).hexdigest()
+                    for cand_name in [f"{k1}.jpg", f"{k2}.jpg", f"{k3}.jpg", f"{file_path.name}.jpg"]:
+                        (THUMBNAILS_DIR / cand_name).unlink(missing_ok=True)
                 except Exception:
                     pass
         except Exception as e:
@@ -101,6 +107,17 @@ def cleanup_expired_files() -> Dict[str, Any]:
             d_count, f_bytes = _clean_directory_by_ttl(user_folder, user_ttl, now)
             total_deleted += d_count
             total_freed += f_bytes
+
+    # 3. Clean orphan thumbnails older than 30 days
+    if THUMBNAILS_DIR.exists():
+        thumb_ttl = 30 * 86400
+        for thumb_f in list(THUMBNAILS_DIR.glob("*.jpg")):
+            if thumb_f.is_file():
+                try:
+                    if now - thumb_f.stat().st_mtime > thumb_ttl:
+                        thumb_f.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     if total_deleted > 0:
         mb = total_freed / (1024 * 1024)

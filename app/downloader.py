@@ -9,12 +9,32 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
+import sys
+
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except Exception:
+    pass
+
 try:
     from curl_cffi import requests as cffi_requests
 except ImportError:
     cffi_requests = None
 
 import requests
+
+
+def get_ytdlp_cmd() -> List[str]:
+    """Resolve yt-dlp command safely across virtualenvs and global PATH."""
+    scripts_dir = Path(sys.executable).parent
+    venv_exe = scripts_dir / ("yt-dlp.exe" if sys.platform == "win32" else "yt-dlp")
+    if venv_exe.exists():
+        return [str(venv_exe)]
+    which = shutil.which("yt-dlp")
+    if which:
+        return [which]
+    return [sys.executable, "-m", "yt_dlp"]
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
@@ -270,16 +290,25 @@ def resolve_download_path(rel_path: Optional[str], user_id: Optional[str] = None
         safe_rel = cand.strip("/\\")
         try:
             resolved = (user_root / safe_rel).resolve()
-            if str(resolved).startswith(str(user_root)):
-                if resolved.exists():
-                    return resolved
+            try:
+                is_safe = resolved.is_relative_to(user_root)
+            except AttributeError:
+                is_safe = (user_root in resolved.parents or resolved == user_root)
+
+            if is_safe and resolved.exists():
+                return resolved
         except Exception:
             pass
 
     # Fallback to unquoted resolved path even if not existing yet (e.g. for new output files)
     try:
         resolved = (user_root / unq.strip("/\\")).resolve()
-        if str(resolved).startswith(str(user_root)):
+        try:
+            is_safe = resolved.is_relative_to(user_root)
+        except AttributeError:
+            is_safe = (user_root in resolved.parents or resolved == user_root)
+
+        if is_safe:
             return resolved
     except Exception:
         pass
@@ -644,10 +673,21 @@ class DownloaderManager:
     @property
     def semaphore(self) -> asyncio.Semaphore:
         if self._semaphore is None:
-            self._semaphore = asyncio.Semaphore(2)
+            max_c = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+            self._semaphore = asyncio.Semaphore(max(1, max_c))
         return self._semaphore
 
+    def prune_old_tasks(self, max_age_seconds: int = 7200):
+        now = time.time()
+        to_del = [
+            tid for tid, t in self.tasks.items()
+            if t.status in ["completed", "error", "cancelled"] and (now - t.created_at > max_age_seconds)
+        ]
+        for tid in to_del:
+            self.tasks.pop(tid, None)
+
     def get_all_tasks(self) -> List[Dict[str, Any]]:
+        self.prune_old_tasks()
         return [task.to_dict() for task in sorted(self.tasks.values(), key=lambda t: t.created_at, reverse=True)]
 
     def clear_finished_tasks(self) -> int:
@@ -754,8 +794,7 @@ class DownloaderManager:
             except Exception:
                 pass
 
-        cmd = [
-            "yt-dlp",
+        cmd = get_ytdlp_cmd() + [
             "--dump-single-json",
             "--no-warnings",
             "--no-update",
@@ -1181,8 +1220,7 @@ class DownloaderManager:
                     else:
                         out_template = str(target_dir / f"{prefix}%(title).150B [%(height)sp].%(ext)s")
 
-                cmd = [
-                    "yt-dlp",
+                cmd = get_ytdlp_cmd() + [
                     "--no-update",
                     "--no-warnings",
                     "--newline",
@@ -1726,8 +1764,10 @@ class DownloaderManager:
         shutil.rmtree(target, ignore_errors=True)
         return True
 
-    def get_file_subtitles(self, filename: str) -> List[Dict[str, Any]]:
-        target = resolve_download_path(filename)
+    def get_file_subtitles(self, filename: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        target = resolve_download_path(filename, user_id)
+        if not target and user_id:
+            target = resolve_download_path(filename, "kexiky")
         if not target or not target.exists() or not target.is_file():
             return []
 
@@ -1787,15 +1827,17 @@ class DownloaderManager:
 
         return subs
 
-    def extract_subtitle_vtt(self, filename: str, track_id: str) -> Optional[str]:
-        target = resolve_download_path(filename)
+    def extract_subtitle_vtt(self, filename: str, track_id: str, user_id: Optional[str] = None) -> Optional[str]:
+        target = resolve_download_path(filename, user_id)
+        if not target and user_id:
+            target = resolve_download_path(filename, "kexiky")
         if not target or not target.exists() or not target.is_file():
             return None
 
         # Check companion file in same folder or downloads
         companion_target = target.parent / track_id
         if not companion_target.exists():
-            companion_target = resolve_download_path(track_id)
+            companion_target = resolve_download_path(track_id, user_id)
 
         if companion_target and companion_target.exists() and companion_target.is_file():
             if companion_target.suffix.lower() == ".vtt":
@@ -1834,24 +1876,44 @@ class DownloaderManager:
             pass
         return None
 
-    def reveal_in_finder(self, filename: str) -> bool:
-        target = resolve_download_path(filename)
+    def reveal_in_finder(self, filename: str, user_id: Optional[str] = None) -> bool:
+        target = resolve_download_path(filename, user_id)
         if not target or not target.exists():
             return False
         try:
-            subprocess.run(["open", "-R", str(target)], check=True)
-            return True
-        except Exception:
+            import platform
+            sys_name = platform.system().lower()
+            if sys_name == "windows":
+                subprocess.Popen(["explorer", f"/select,{str(target.resolve())}"])
+                return True
+            elif sys_name == "darwin":
+                subprocess.run(["open", "-R", str(target)], check=True)
+                return True
+            else:
+                subprocess.run(["xdg-open", str(target.parent)], check=True)
+                return True
+        except Exception as e:
+            print(f"[Reveal] Error opening file: {e}")
             return False
 
-    def open_downloads_folder(self, subfolder: Optional[str] = None) -> bool:
-        target = resolve_download_path(subfolder) if subfolder else DOWNLOADS_DIR
+    def open_downloads_folder(self, subfolder: Optional[str] = None, user_id: Optional[str] = None) -> bool:
+        target = resolve_download_path(subfolder, user_id) if subfolder else get_user_root(user_id)
         if not target or not target.exists():
-            target = DOWNLOADS_DIR
+            target = get_user_root(user_id)
         try:
-            subprocess.run(["open", str(target)], check=True)
-            return True
-        except Exception:
+            import platform
+            sys_name = platform.system().lower()
+            if sys_name == "windows":
+                os.startfile(str(target.resolve()))
+                return True
+            elif sys_name == "darwin":
+                subprocess.run(["open", str(target)], check=True)
+                return True
+            else:
+                subprocess.run(["xdg-open", str(target)], check=True)
+                return True
+        except Exception as e:
+            print(f"[OpenFolder] Error opening folder: {e}")
             return False
 
 
