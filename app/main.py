@@ -23,9 +23,22 @@ from app.cleanup import cleanup_loop, cleanup_expired_files
 
 app = FastAPI(title="MediaPull — Universal Media Downloader by Kexiky")
 
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+if allowed_origins_env:
+    allowed_origins = [orig.strip() for orig in allowed_origins_env.split(",") if orig.strip()]
+else:
+    web_url = os.getenv("MEDIAPULL_WEB_URL", "http://127.0.0.1:8000").rstrip("/")
+    allowed_origins = list({
+        web_url,
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    })
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -503,7 +516,7 @@ VIDEO_SVG_FALLBACK = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640
 @app.get("/api/history")
 async def get_history(request: Request):
     user = get_current_user(request)
-    data = downloader_manager.list_history(user_id=user["user_id"], role=user["role"])
+    data = await asyncio.to_thread(downloader_manager.list_history, user_id=user["user_id"], role=user["role"])
     res = JSONResponse({
         "files": data["files"],
         "playlists": data["playlists"],
@@ -519,9 +532,9 @@ async def get_history(request: Request):
 @app.api_route("/api/thumbnail/{filename:path}", methods=["GET", "HEAD"])
 async def get_thumbnail(filename: str, request: Request):
     user = get_current_user(request)
-    thumb_path = downloader_manager.get_or_create_thumbnail(filename, user_id=user["user_id"])
+    thumb_path = await asyncio.to_thread(downloader_manager.get_or_create_thumbnail, filename, user_id=user["user_id"])
     if not thumb_path and user.get("is_creator"):
-        thumb_path = downloader_manager.get_or_create_thumbnail(filename, user_id="kexiky")
+        thumb_path = await asyncio.to_thread(downloader_manager.get_or_create_thumbnail, filename, user_id="kexiky")
 
     if thumb_path and thumb_path.exists() and thumb_path.stat().st_size > 0:
         return FileResponse(
@@ -705,8 +718,13 @@ async def batch_delete_files(req: BatchFilesRequest, request: Request):
 
 
 @app.post("/api/reveal/{filename:path}")
-async def reveal_file(filename: str):
-    success = downloader_manager.reveal_in_finder(filename)
+async def reveal_file(filename: str, request: Request):
+    user = get_current_user(request)
+    if user.get("role") == "guest":
+        raise HTTPException(status_code=403, detail="Доступ запрещен в гостевом режиме")
+    success = downloader_manager.reveal_in_finder(filename, user_id=user["user_id"])
+    if not success and user.get("is_creator"):
+        success = downloader_manager.reveal_in_finder(filename, user_id="kexiky")
     if not success:
         raise HTTPException(status_code=404, detail="Файл не найден")
     return {"status": "revealed", "filename": filename}
@@ -716,32 +734,37 @@ class OpenFolderRequest(BaseModel):
     subfolder: Optional[str] = None
 
 @app.post("/api/open-folder")
-async def open_folder(req: Optional[OpenFolderRequest] = None):
+async def open_folder(request: Request, req: Optional[OpenFolderRequest] = None):
+    user = get_current_user(request)
+    if user.get("role") == "guest":
+        raise HTTPException(status_code=403, detail="Доступ запрещен в гостевом режиме")
     sub = req.subfolder if req else None
-    success = downloader_manager.open_downloads_folder(sub)
+    success = downloader_manager.open_downloads_folder(sub, user_id=user["user_id"])
     return {"status": "opened" if success else "failed"}
 
 
 @app.get("/api/subtitles/{filename:path}")
-async def get_subtitles(filename: str):
-    subs = downloader_manager.get_file_subtitles(filename)
+async def get_subtitles(filename: str, request: Request):
+    user = get_current_user(request)
+    subs = downloader_manager.get_file_subtitles(filename, user_id=user["user_id"])
     return {"subtitles": subs}
 
 
 @app.get("/api/subtitles-track")
-async def get_subtitle_vtt_param(filename: str, track_id: str):
-    return await get_subtitle_vtt(filename=filename, track_id=track_id)
+async def get_subtitle_vtt_param(filename: str, track_id: str, request: Request):
+    return await get_subtitle_vtt(filename=filename, track_id=track_id, request=request)
 
 
 @app.get("/api/subtitles-track/{filename}/{track_id:path}")
-async def get_subtitle_vtt(filename: str, track_id: str):
+async def get_subtitle_vtt(filename: str, track_id: str, request: Request):
+    user = get_current_user(request)
     raw_track_id = track_id
     if raw_track_id.endswith(".vtt") and not raw_track_id.endswith(".vtt.vtt"):
         raw_track_id = raw_track_id[:-4]
 
-    vtt_content = downloader_manager.extract_subtitle_vtt(filename, raw_track_id)
+    vtt_content = downloader_manager.extract_subtitle_vtt(filename, raw_track_id, user_id=user["user_id"])
     if not vtt_content:
-        vtt_content = downloader_manager.extract_subtitle_vtt(filename, track_id)
+        vtt_content = downloader_manager.extract_subtitle_vtt(filename, track_id, user_id=user["user_id"])
 
     if not vtt_content:
         raise HTTPException(status_code=404, detail="Субтитры не найдены")

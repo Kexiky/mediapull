@@ -7,9 +7,35 @@ import re
 from typing import Dict, Any, Optional
 from fastapi import Request
 
-from app.database import get_user_by_username, get_user_by_id, ROLE_CONFIGS
+import secrets
+from app.database import get_user_by_username, get_user_by_id, ROLE_CONFIGS, DATA_DIR
 
-SECRET_KEY = os.getenv("MEDIAPULL_SECRET_KEY", "mediapull_kexiky_master_key_2026")
+
+def _get_secret_key() -> str:
+    env_secret = os.getenv("MEDIAPULL_SECRET_KEY")
+    if env_secret and env_secret.strip() and env_secret != "mediapull_kexiky_master_key_2026":
+        return env_secret.strip()
+
+    secret_file = DATA_DIR / ".secret_key"
+    if secret_file.exists():
+        try:
+            key = secret_file.read_text(encoding="utf-8").strip()
+            if key:
+                return key
+        except Exception:
+            pass
+
+    new_secret = secrets.token_hex(32)
+    try:
+        secret_file.write_text(new_secret, encoding="utf-8")
+        print("[Security] Generated and stored persistent SECRET_KEY in data/.secret_key")
+    except Exception:
+        pass
+    return new_secret
+
+
+SECRET_KEY = _get_secret_key()
+TOKEN_MAX_AGE_SECONDS = int(os.getenv("MEDIAPULL_TOKEN_MAX_AGE", 60 * 86400))  # 60 days default
 
 
 def _sign_payload(payload: str) -> str:
@@ -39,14 +65,27 @@ def verify_user_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
     parts = payload.split(":")
-    # Support new format: mp:{user_id}:{username}:{role}:{timestamp}
+    # Support format: mp:{user_id}:{username}:{role}:{timestamp}
     if len(parts) >= 5 and parts[0] == "mp":
+        try:
+            token_ts = int(parts[4])
+            if time.time() - token_ts > TOKEN_MAX_AGE_SECONDS:
+                return None  # Token expired
+        except (ValueError, IndexError):
+            return None
+
         username = parts[2]
         user = get_user_by_username(username)
         return user
 
     # Backward compatibility with creator token: creator:kexiky:{timestamp}
-    if len(parts) >= 2 and parts[0] == "creator" and parts[1] == "kexiky":
+    if len(parts) >= 3 and parts[0] == "creator" and parts[1] == "kexiky":
+        try:
+            token_ts = int(parts[2])
+            if time.time() - token_ts > TOKEN_MAX_AGE_SECONDS:
+                return None
+        except (ValueError, IndexError):
+            return None
         return get_user_by_username("kexiky")
 
     return None

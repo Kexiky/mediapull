@@ -65,8 +65,11 @@ ROLE_CONFIGS = {
 
 
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 
@@ -117,7 +120,28 @@ def init_db():
         cur.execute("SELECT id, role FROM users WHERE username = 'kexiky'")
         row = cur.fetchone()
         if not row:
-            master_pass = os.getenv("KEXIKY_PASSWORD", "kexiky")
+            master_pass = os.getenv("KEXIKY_PASSWORD")
+            if not master_pass or master_pass.strip() == "kexiky":
+                pass_file = DATA_DIR / ".creator_password"
+                if pass_file.exists():
+                    try:
+                        master_pass = pass_file.read_text(encoding="utf-8").strip()
+                    except Exception:
+                        master_pass = ""
+                if not master_pass:
+                    master_pass = secrets.token_urlsafe(12)
+                    try:
+                        pass_file.write_text(master_pass, encoding="utf-8")
+                    except Exception:
+                        pass
+                print("=" * 64)
+                print(f"[Security] Admin 'kexiky' initialized.")
+                print(f"[Security] Generated Password: {master_pass}")
+                print(f"[Security] Saved to data/.creator_password (set KEXIKY_PASSWORD in .env to override)")
+                print("=" * 64)
+            else:
+                master_pass = master_pass.strip()
+
             pw_hash, salt = hash_password(master_pass)
             cur.execute("""
                 INSERT INTO users (username, password_hash, salt, role, created_at)
