@@ -4,11 +4,20 @@ import hashlib
 import time
 import uuid
 import re
-from typing import Dict, Any, Optional
-from fastapi import Request
-
 import secrets
-from app.database import get_user_by_username, get_user_by_id, ROLE_CONFIGS, DATA_DIR
+from typing import Dict, Any, Optional
+
+from fastapi import Depends, HTTPException, Request
+
+from app.database import get_user_by_id, ROLE_CONFIGS, CREATOR_USERNAME, DATA_DIR
+from app.ratelimit import SlidingWindowLimiter, client_ip
+
+GUEST_ID_RE = re.compile(r"^guest_[a-f0-9]{10,32}$")
+
+# New anonymous sessions per client address per hour (guests are free to create, so cap them).
+_new_guest_limiter = SlidingWindowLimiter(
+    max_events=int(os.getenv("MEDIAPULL_GUEST_SESSIONS_PER_HOUR", "60")), window_seconds=3600
+)
 
 
 def _get_secret_key() -> str:
@@ -28,9 +37,13 @@ def _get_secret_key() -> str:
     new_secret = secrets.token_hex(32)
     try:
         secret_file.write_text(new_secret, encoding="utf-8")
+        try:
+            os.chmod(secret_file, 0o600)
+        except OSError:
+            pass
         print("[Security] Generated and stored persistent SECRET_KEY in data/.secret_key")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Security] WARNING: could not persist SECRET_KEY ({e}); sessions will reset on restart")
     return new_secret
 
 
@@ -54,41 +67,89 @@ def _verify_signature(signed_token: str) -> Optional[str]:
 
 
 def create_user_token(user_id: int, username: str, role: str) -> str:
-    """Generate a signed long-lived authentication token for a user."""
+    """Generate a signed authentication token for a user."""
     payload = f"mp:{user_id}:{username}:{role}:{int(time.time())}"
     return _sign_payload(payload)
 
 
 def verify_user_token(token: str) -> Optional[Dict[str, Any]]:
+    """Resolve a token to a user record.
+
+    The account is looked up by its numeric id and the username embedded in the token must match
+    it exactly, so a token can never be redirected to another account through case folding.
+    """
     payload = _verify_signature(token)
     if not payload:
         return None
 
     parts = payload.split(":")
-    # Support format: mp:{user_id}:{username}:{role}:{timestamp}
-    if len(parts) >= 5 and parts[0] == "mp":
-        try:
-            token_ts = int(parts[4])
-            if time.time() - token_ts > TOKEN_MAX_AGE_SECONDS:
-                return None  # Token expired
-        except (ValueError, IndexError):
-            return None
+    if len(parts) != 5 or parts[0] != "mp":
+        return None
+    try:
+        user_id = int(parts[1])
+        token_ts = int(parts[4])
+    except ValueError:
+        return None
 
-        username = parts[2]
-        user = get_user_by_username(username)
-        return user
+    if time.time() - token_ts > TOKEN_MAX_AGE_SECONDS:
+        return None
 
-    # Backward compatibility with creator token: creator:kexiky:{timestamp}
-    if len(parts) >= 3 and parts[0] == "creator" and parts[1] == "kexiky":
-        try:
-            token_ts = int(parts[2])
-            if time.time() - token_ts > TOKEN_MAX_AGE_SECONDS:
-                return None
-        except (ValueError, IndexError):
-            return None
-        return get_user_by_username("kexiky")
+    user = get_user_by_id(user_id)
+    if not user or user["username"] != parts[2]:
+        return None
+    if token_ts < int(user.get("tokens_valid_after") or 0):
+        return None  # revoked by a password change / reset
+    return user
 
+
+def create_guest_session_token(guest_id: str) -> str:
+    return _sign_payload(guest_id)
+
+
+def verify_guest_session_token(token: Optional[str]) -> Optional[str]:
+    payload = _verify_signature(token or "")
+    if payload and GUEST_ID_RE.match(payload):
+        return payload
     return None
+
+
+def _build_user(
+    *,
+    user_id: str,
+    db_id: Optional[int],
+    username: str,
+    role: str,
+    created_at: Optional[float],
+    is_new_session: bool = False,
+    session_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    role_cfg = ROLE_CONFIGS.get(role, ROLE_CONFIGS["user"])
+    is_creator = (role != "guest" and username == CREATOR_USERNAME)
+    return {
+        "user_id": user_id,
+        "db_id": db_id,
+        "username": username,
+        "role": role,
+        "role_title": role_cfg["title"],
+        "role_icon": role_cfg["icon"],
+        "role_badge_class": role_cfg["badge_class"],
+        "is_admin": role == "admin",
+        "is_creator": is_creator,
+        "is_permanent": role_cfg["ttl_seconds"] is None,
+        "ttl_seconds": role_cfg["ttl_seconds"],
+        "ttl_days": role_cfg["ttl_days"],
+        "ttl_display": role_cfg["ttl_display"],
+        "storage_limit_bytes": role_cfg["storage_limit_bytes"],
+        "storage_limit_display": role_cfg["storage_limit_display"],
+        "created_at": created_at,
+        "is_new_session": is_new_session,
+        "session_token": session_token,
+    }
+
+
+def public_user(user: Dict[str, Any]) -> Dict[str, Any]:
+    """User dict that is safe to return to the browser (no session secrets)."""
+    return {k: v for k, v in user.items() if k != "session_token"}
 
 
 def get_current_user(request: Request) -> Dict[str, Any]:
@@ -96,7 +157,7 @@ def get_current_user(request: Request) -> Dict[str, Any]:
     Extract user info from cookies or headers.
     Returns a unified user dict with role, storage quota, and TTL info.
     """
-    # 1. Check Authenticated User Token
+    # 1. Authenticated user token
     auth_cookie = request.cookies.get("mediapull_auth")
     auth_header = request.headers.get("X-MediaPull-Token")
     if not auth_header:
@@ -104,82 +165,65 @@ def get_current_user(request: Request) -> Dict[str, Any]:
         if auth_bearer.startswith("Bearer "):
             auth_header = auth_bearer[7:].strip()
 
-    token = auth_cookie or auth_header
-    if token:
+    for token in (auth_cookie, auth_header):
+        if not token:
+            continue
         user_record = verify_user_token(token)
         if user_record:
-            role = user_record.get("role", "user")
-            role_cfg = ROLE_CONFIGS.get(role, ROLE_CONFIGS["user"])
             username = user_record["username"]
-            is_admin = (role == "admin") or (username == "kexiky")
-            return {
-                "user_id": username,
-                "db_id": user_record["id"],
-                "username": username,
-                "role": role,
-                "role_title": role_cfg["title"],
-                "role_icon": role_cfg["icon"],
-                "role_badge_class": role_cfg["badge_class"],
-                "is_admin": is_admin,
-                "is_creator": (username == "kexiky"),
-                "is_permanent": (role_cfg["ttl_seconds"] is None),
-                "ttl_seconds": role_cfg["ttl_seconds"],
-                "ttl_days": role_cfg["ttl_days"],
-                "ttl_display": role_cfg["ttl_display"],
-                "storage_limit_bytes": role_cfg["storage_limit_bytes"],
-                "storage_limit_display": role_cfg["storage_limit_display"],
-                "created_at": user_record.get("created_at"),
-                "is_new_session": False,
-            }
+            return _build_user(
+                user_id=username,
+                db_id=user_record["id"],
+                username=username,
+                role=user_record.get("role", "user"),
+                created_at=user_record.get("created_at"),
+            )
 
-    # 2. Check Guest Session
-    session_cookie = request.cookies.get("mediapull_session")
-    session_header = request.headers.get("X-MediaPull-Session")
-    raw_session = session_cookie or session_header
+    # 2. Existing guest session (signed, so a client cannot pick someone else's id)
+    guest_id = verify_guest_session_token(
+        request.cookies.get("mediapull_session") or request.headers.get("X-MediaPull-Session")
+    )
+    if guest_id:
+        return _build_user(
+            user_id=guest_id,
+            db_id=None,
+            username=f"Гость (#{guest_id[-5:]})",
+            role="guest",
+            created_at=None,
+        )
 
-    guest_cfg = ROLE_CONFIGS["guest"]
-    if raw_session and re.match(r"^guest_[a-zA-Z0-9_-]{6,32}$", raw_session):
-        guest_id = raw_session
-        short_id = guest_id[-5:]
-        return {
-            "user_id": guest_id,
-            "db_id": None,
-            "username": f"Гость (#{short_id})",
-            "role": "guest",
-            "role_title": guest_cfg["title"],
-            "role_icon": guest_cfg["icon"],
-            "role_badge_class": guest_cfg["badge_class"],
-            "is_admin": False,
-            "is_creator": False,
-            "is_permanent": False,
-            "ttl_seconds": guest_cfg["ttl_seconds"],
-            "ttl_days": guest_cfg["ttl_days"],
-            "ttl_display": guest_cfg["ttl_display"],
-            "storage_limit_bytes": guest_cfg["storage_limit_bytes"],
-            "storage_limit_display": guest_cfg["storage_limit_display"],
-            "created_at": None,
-            "is_new_session": False,
-        }
+    # 3. Issue a new guest session
+    ip = client_ip(request)
+    if not _new_guest_limiter.hit(ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком много новых гостевых сессий. Попробуйте позже.",
+            headers={"Retry-After": str(_new_guest_limiter.retry_after(ip))},
+        )
+    new_guest_id = f"guest_{uuid.uuid4().hex[:16]}"
+    return _build_user(
+        user_id=new_guest_id,
+        db_id=None,
+        username=f"Гость (#{new_guest_id[-5:]})",
+        role="guest",
+        created_at=None,
+        is_new_session=True,
+        session_token=create_guest_session_token(new_guest_id),
+    )
 
-    # 3. Issue new guest session
-    new_guest_id = f"guest_{uuid.uuid4().hex[:10]}"
-    short_id = new_guest_id[-5:]
-    return {
-        "user_id": new_guest_id,
-        "db_id": None,
-        "username": f"Гость (#{short_id})",
-        "role": "guest",
-        "role_title": guest_cfg["title"],
-        "role_icon": guest_cfg["icon"],
-        "role_badge_class": guest_cfg["badge_class"],
-        "is_admin": False,
-        "is_creator": False,
-        "is_permanent": False,
-        "ttl_seconds": guest_cfg["ttl_seconds"],
-        "ttl_days": guest_cfg["ttl_days"],
-        "ttl_display": guest_cfg["ttl_display"],
-        "storage_limit_bytes": guest_cfg["storage_limit_bytes"],
-        "storage_limit_display": guest_cfg["storage_limit_display"],
-        "created_at": None,
-        "is_new_session": True,
-    }
+
+def current_user(request: Request) -> Dict[str, Any]:
+    """FastAPI dependency: any visitor (registered user or guest)."""
+    return get_current_user(request)
+
+
+def require_registered(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    if user.get("role") == "guest":
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    return user
+
+
+def require_admin(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Доступ запрещен. Требуются права администратора.")
+    return user

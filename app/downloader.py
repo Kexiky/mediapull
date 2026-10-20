@@ -1,21 +1,28 @@
 import asyncio
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
+import sys
+import threading
 import time
+import urllib.parse
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
-import sys
+from app.roles import ROLE_CONFIGS, CREATOR_USERNAME
 
-try:
-    import static_ffmpeg
-    static_ffmpeg.add_paths()
-except Exception:
-    pass
+if not shutil.which("ffmpeg"):
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+    except Exception:
+        pass
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -36,32 +43,115 @@ def get_ytdlp_cmd() -> List[str]:
         return [which]
     return [sys.executable, "-m", "yt_dlp"]
 
+def get_ytdlp_global_args() -> List[str]:
+    """Server-wide yt-dlp options from the environment: cookies (age-restricted / private media) and proxy.
+
+    Only the operator can set these (YTDLP_COOKIES_FILE, YTDLP_PROXY); nothing here is user-controlled.
+    """
+    args: List[str] = []
+    cookies = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+    if cookies and os.path.isfile(cookies):
+        args += ["--cookies", cookies]
+    proxy = os.getenv("YTDLP_PROXY", "").strip()
+    if proxy:
+        args += ["--proxy", proxy]
+    return args
+
+
 BASE_DIR = Path(__file__).resolve().parent.parent
-DOWNLOADS_DIR = BASE_DIR / "downloads"
+DOWNLOADS_DIR = Path(os.getenv("MEDIAPULL_DOWNLOADS_DIR") or (BASE_DIR / "downloads"))
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 THUMBNAILS_DIR = DOWNLOADS_DIR / ".thumbnails"
 THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR = DOWNLOADS_DIR / ".temp"
 META_CACHE_FILE = THUMBNAILS_DIR / "meta_cache.json"
 
+# Top-level folders of DOWNLOADS_DIR that belong to other owners (never part of the creator's own library).
+RESERVED_ROOT_DIRS = {"guests", "users", "temp_tg"}
+TEMP_USER_PREFIX = "tg_temp"
+
+MIN_FREE_DISK_BYTES = int(float(os.getenv("MEDIAPULL_MIN_FREE_DISK_GB", "1")) * 1024 ** 3)
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
+ALLOW_PRIVATE_URLS = os.getenv("MEDIAPULL_ALLOW_PRIVATE_URLS", "").strip().lower() in ("1", "true", "yes", "on")
+
+# ---------------------------------------------------------------------------
+# Metadata cache (thread-safe, atomically written, debounced)
+# ---------------------------------------------------------------------------
 _meta_cache: Dict[str, Any] = {}
+_meta_lock = threading.RLock()
+_meta_dirty = False
+_meta_last_save = 0.0
+META_SAVE_INTERVAL = 5.0
+
 
 def _load_meta_cache():
     global _meta_cache
     if META_CACHE_FILE.exists():
         try:
             with open(META_CACHE_FILE, "r", encoding="utf-8") as f:
-                _meta_cache = json.load(f)
+                loaded = json.load(f)
+            _meta_cache = loaded if isinstance(loaded, dict) else {}
         except Exception:
             _meta_cache = {}
 
-def _save_meta_cache():
+
+def _write_meta_cache_locked():
+    global _meta_dirty, _meta_last_save
+    tmp = META_CACHE_FILE.with_suffix(".json.tmp")
     try:
-        with open(META_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_meta_cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_meta_cache, f, ensure_ascii=False)
+        os.replace(tmp, META_CACHE_FILE)
+        _meta_dirty = False
+    except Exception as e:
+        print(f"[MetaCache] Could not save cache: {e}")
+    finally:
+        _meta_last_save = time.monotonic()
+
+
+def _save_meta_cache(force: bool = False):
+    """Mark the cache dirty and write it at most once per META_SAVE_INTERVAL."""
+    global _meta_dirty
+    with _meta_lock:
+        _meta_dirty = True
+        if force or time.monotonic() - _meta_last_save >= META_SAVE_INTERVAL:
+            _write_meta_cache_locked()
+
+
+def flush_meta_cache():
+    with _meta_lock:
+        if _meta_dirty:
+            _write_meta_cache_locked()
+
+
+def prune_meta_cache() -> int:
+    """Drop cache entries whose media file no longer exists. Returns number of removed entries."""
+    with _meta_lock:
+        keys = list(_meta_cache.keys())
+    stale = [k for k in keys if not (DOWNLOADS_DIR / k).exists()]
+    if stale:
+        with _meta_lock:
+            for k in stale:
+                _meta_cache.pop(k, None)
+        _save_meta_cache(force=True)
+    return len(stale)
+
+
+def _cache_key(filepath: Path) -> str:
+    """Cache key unique across all owners: path relative to DOWNLOADS_DIR."""
+    try:
+        return filepath.relative_to(DOWNLOADS_DIR).as_posix()
+    except ValueError:
+        return filepath.as_posix()
+
 
 _load_meta_cache()
+
+
+def thumbnail_cache_name(user_prefix: Optional[str], rel_posix: str) -> str:
+    """File name of the cached thumbnail for `rel_posix` (path relative to the owner's root)."""
+    key = f"{user_prefix or CREATOR_USERNAME}:{rel_posix.strip('/')}"
+    return hashlib.md5(key.encode("utf-8"), usedforsecurity=False).hexdigest() + ".jpg"
 
 # Helper for human-readable sizes
 def format_size(bytes_val: Optional[int]) -> str:
@@ -142,6 +232,128 @@ def instagram_shortcode_to_id(shortcode: str) -> int:
         media_id = media_id * 64 + alphabet.index(char)
     return media_id
 
+
+# ---------------------------------------------------------------------------
+# URL validation and safe remote fetching (SSRF / local file protection)
+# ---------------------------------------------------------------------------
+MAX_URL_LENGTH = 2048
+_FETCH_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"}
+
+
+def validate_media_url(url: Optional[str]) -> str:
+    """Syntax check: a single http(s) URL. Rejects option-like strings, other schemes and control characters."""
+    url = (url or "").strip()
+    if not url or len(url) > MAX_URL_LENGTH:
+        raise ValueError("Введите корректную ссылку")
+    if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url):
+        raise ValueError("Ссылка содержит недопустимые символы")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname
+    except ValueError:
+        raise ValueError("Введите корректную ссылку")
+    if parsed.scheme.lower() not in ("http", "https") or not host:
+        raise ValueError("Поддерживаются только ссылки http:// и https://")
+    return url
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+def assert_public_host(hostname: str) -> None:
+    """Raise ValueError when `hostname` resolves to a loopback / private / link-local address."""
+    if ALLOW_PRIVATE_URLS:
+        return
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        raise ValueError("Не удалось определить адрес сервера")
+    if not infos:
+        raise ValueError("Не удалось определить адрес сервера")
+    for info in infos:
+        if not _is_public_ip(info[4][0]):
+            raise ValueError("Ссылки на внутреннюю сеть и локальные адреса запрещены")
+
+
+async def validate_public_url(url: Optional[str]) -> str:
+    """validate_media_url + DNS check, without blocking the event loop."""
+    clean = validate_media_url(url)
+    await asyncio.to_thread(assert_public_host, urllib.parse.urlsplit(clean).hostname)
+    return clean
+
+
+def _fetch_once(url: str, max_bytes: int, timeout: float):
+    """One HTTP GET without following redirects. Returns (body, redirect_location)."""
+    last_error = "ошибка соединения"
+    try:
+        with requests.get(url, headers=_FETCH_HEADERS, timeout=timeout, stream=True, allow_redirects=False) as r:
+            if 300 <= r.status_code < 400 and r.headers.get("Location"):
+                return None, r.headers["Location"]
+            if r.status_code == 200:
+                declared = r.headers.get("Content-Length")
+                if declared and declared.isdigit() and int(declared) > max_bytes:
+                    raise ValueError("Файл слишком большой")
+                chunks, total = [], 0
+                for chunk in r.iter_content(64 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError("Файл слишком большой")
+                    chunks.append(chunk)
+                return b"".join(chunks), None
+            last_error = f"HTTP {r.status_code}"
+            if r.status_code not in (401, 403, 429):
+                raise ValueError(last_error)
+    except requests.RequestException as e:
+        last_error = str(e)
+
+    if cffi_requests is None:
+        raise ValueError(f"Не удалось загрузить файл: {last_error}")
+
+    # Anti-bot fallback: browser TLS impersonation.
+    try:
+        r = cffi_requests.get(url, impersonate="chrome124", timeout=timeout, allow_redirects=False)
+    except Exception as e:
+        raise ValueError(f"Не удалось загрузить файл: {e}")
+    if 300 <= r.status_code < 400 and r.headers.get("Location"):
+        return None, r.headers["Location"]
+    if r.status_code != 200:
+        raise ValueError(f"Не удалось загрузить файл: HTTP {r.status_code}")
+    declared = r.headers.get("Content-Length")
+    if (declared and declared.isdigit() and int(declared) > max_bytes) or len(r.content) > max_bytes:
+        raise ValueError("Файл слишком большой")
+    return r.content, None
+
+
+def safe_fetch_bytes(url: str, max_bytes: int = MAX_IMAGE_BYTES, timeout: float = 20, max_redirects: int = 5) -> bytes:
+    """Download a small remote file. Only http(s), every redirect hop is re-validated against private networks."""
+    current = validate_media_url(url)
+    for _ in range(max_redirects + 1):
+        assert_public_host(urllib.parse.urlsplit(current).hostname)
+        body, location = _fetch_once(current, max_bytes, timeout)
+        if location is None:
+            return body
+        current = validate_media_url(urllib.parse.urljoin(current, location))
+    raise ValueError("Слишком много перенаправлений")
+
+
+def looks_like_image(data: bytes) -> bool:
+    head = data[:16]
+    return (
+        head.startswith(b"\xff\xd8\xff")
+        or head.startswith(b"\x89PNG\r\n\x1a\n")
+        or head.startswith(b"GIF8")
+        or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+        or head[4:8] == b"ftyp"  # AVIF / HEIC
+    )
+
+
 def extract_instagram_post(url: str) -> Optional[Dict[str, Any]]:
     """Extract Instagram Post, Reel, Photo, or Carousel via GraphQL with impersonation."""
     m = re.search(r"(?:instagram\.com/(?:p|reel|reels|tv)/)([A-Za-z0-9_-]+)", url)
@@ -156,6 +368,7 @@ def extract_instagram_post(url: str) -> Optional[Dict[str, Any]]:
     if not cffi_requests:
         return None
 
+    s = None
     try:
         s = cffi_requests.Session(impersonate="chrome124")
         r_home = s.get("https://www.instagram.com/", headers={
@@ -197,52 +410,122 @@ def extract_instagram_post(url: str) -> Optional[Dict[str, Any]]:
         return target
     except Exception:
         return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Per-owner storage layout
+# ---------------------------------------------------------------------------
+def is_temp_user(user_id: Optional[str]) -> bool:
+    return bool(user_id) and str(user_id).startswith(TEMP_USER_PREFIX)
+
+
+def _safe_uid(user_id: str) -> str:
+    clean = re.sub(r"[^a-zA-Z0-9_-]", "", user_id)
+    if clean != user_id or not clean:
+        # Legacy / unusual ids: keep the folder unique instead of colliding with other users.
+        clean = (clean or "u") + "_" + hashlib.sha1(user_id.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+    return clean
+
 
 def get_user_root(user_id: Optional[str] = None, role: Optional[str] = None) -> Path:
-    """Return root directory for a given user. Creator 'kexiky' or admin maps to DOWNLOADS_DIR."""
-    if user_id == "tg_temp":
-        temp_root = DOWNLOADS_DIR / "temp_tg"
+    """Return the root directory of a storage owner.
+
+    Only the creator ('kexiky') maps to DOWNLOADS_DIR itself; every other account (admins included)
+    gets its own folder. `role` is accepted for backward compatibility and no longer influences the path,
+    so reading and writing always agree on the location.
+    """
+    if is_temp_user(user_id):
+        sub = re.sub(r"[^a-zA-Z0-9_-]", "", str(user_id)[len(TEMP_USER_PREFIX):]).lstrip("_-")
+        temp_root = DOWNLOADS_DIR / "temp_tg" / sub if sub else DOWNLOADS_DIR / "temp_tg"
         temp_root.mkdir(parents=True, exist_ok=True)
         return temp_root
-    if not user_id or user_id == "kexiky" or role == "admin":
+    if not user_id or user_id == CREATOR_USERNAME:
         return DOWNLOADS_DIR
-    clean_uid = re.sub(r"[^a-zA-Z0-9_-]", "", user_id)
+    clean_uid = _safe_uid(user_id)
     if clean_uid.startswith("guest_"):
         guest_root = DOWNLOADS_DIR / "guests" / clean_uid
         guest_root.mkdir(parents=True, exist_ok=True)
         return guest_root
-    else:
-        user_root = DOWNLOADS_DIR / "users" / clean_uid
-        user_root.mkdir(parents=True, exist_ok=True)
-        return user_root
+    user_root = DOWNLOADS_DIR / "users" / clean_uid
+    user_root.mkdir(parents=True, exist_ok=True)
+    return user_root
 
 
-def get_user_disk_usage(user_id: Optional[str] = "kexiky", role: Optional[str] = None) -> Dict[str, Any]:
-    """Calculate total bytes used and file count for a user."""
-    if user_id == "tg_temp":
-        return {"total_bytes": 0, "file_count": 0, "total_size_str": "0 B"}
-    user_root = get_user_root(user_id, role)
-    if not user_root.exists():
-        return {"total_bytes": 0, "file_count": 0, "total_size_str": "0 B"}
+def remove_user_files(user_id: str) -> None:
+    """Delete everything a (deleted) user owns, so a re-registered name cannot inherit old files."""
+    if not user_id or user_id == CREATOR_USERNAME or is_temp_user(user_id):
+        return
+    clean_uid = _safe_uid(user_id)
+    base = DOWNLOADS_DIR / ("guests" if clean_uid.startswith("guest_") else "users")
+    shutil.rmtree(base / clean_uid, ignore_errors=True)
+    invalidate_usage(user_id)
 
-    is_kexiky = (not user_id or user_id == "kexiky" or role == "admin")
+
+_usage_cache: Dict[str, tuple] = {}
+_usage_lock = threading.Lock()
+USAGE_CACHE_TTL = 30.0
+
+
+def invalidate_usage(user_id: Optional[str] = None) -> None:
+    with _usage_lock:
+        if user_id is None:
+            _usage_cache.clear()
+        else:
+            _usage_cache.pop(user_id or CREATOR_USERNAME, None)
+
+
+def _scan_usage(root: Path, skip_reserved: bool) -> tuple:
     total_bytes = 0
     file_count = 0
-    for p in user_root.rglob("*"):
-        if is_kexiky and any(part in ["guests", "users"] for part in p.parts):
-            continue
-        if p.is_file() and not p.name.startswith("."):
+    root_str = str(root)
+    for dirpath, dirnames, filenames in os.walk(root_str):
+        if dirpath == root_str and skip_reserved:
+            dirnames[:] = [d for d in dirnames if d not in RESERVED_ROOT_DIRS]
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in filenames:
+            if name.startswith("."):
+                continue
             try:
-                total_bytes += p.stat().st_size
+                total_bytes += os.stat(os.path.join(dirpath, name)).st_size
                 file_count += 1
-            except Exception:
+            except OSError:
                 pass
+    return total_bytes, file_count
 
-    return {
+
+def get_user_disk_usage(user_id: Optional[str] = CREATOR_USERNAME, role: Optional[str] = None, use_cache: bool = True) -> Dict[str, Any]:
+    """Calculate total bytes used and file count for a user (cached for a short time)."""
+    if is_temp_user(user_id):
+        return {"total_bytes": 0, "file_count": 0, "total_size_str": "0 B"}
+
+    cache_key = user_id or CREATOR_USERNAME
+    now = time.monotonic()
+    if use_cache:
+        with _usage_lock:
+            hit = _usage_cache.get(cache_key)
+            if hit and hit[0] > now:
+                return dict(hit[1])
+
+    user_root = get_user_root(user_id)
+    if user_root.exists():
+        total_bytes, file_count = _scan_usage(user_root, skip_reserved=(user_root == DOWNLOADS_DIR))
+    else:
+        total_bytes, file_count = 0, 0
+
+    result = {
         "total_bytes": total_bytes,
         "file_count": file_count,
-        "total_size_str": format_size(total_bytes)
+        "total_size_str": format_size(total_bytes) if total_bytes else "0 B",
     }
+    with _usage_lock:
+        _usage_cache[cache_key] = (now + USAGE_CACHE_TTL, result)
+    return dict(result)
 
 
 def get_resolution_tier(w: Optional[int], h: Optional[int]) -> int:
@@ -269,62 +552,125 @@ def get_resolution_tier(w: Optional[int], h: Optional[int]) -> int:
         return 360
     return min_d
 
+def _resolve_inside(user_root: Path, candidate: str) -> Optional[Path]:
+    """Resolve `candidate` under `user_root`; None when it escapes the root or touches hidden/internal paths."""
+    if "\x00" in candidate:
+        return None
+    safe_rel = candidate.strip("/\\")
+    if not safe_rel:
+        return None
+    parts = [p for p in re.split(r"[\\/]+", safe_rel) if p]
+    for part in parts:
+        # Hidden entries (.thumbnails, .temp, .playlist_meta.json, ...) and '..' are internal; only covers are public.
+        if part.startswith(".") and part != ".cover.jpg":
+            return None
+    if user_root == DOWNLOADS_DIR.resolve() and parts and parts[0] == "temp_tg":
+        return None
+    try:
+        resolved = (user_root / safe_rel).resolve()
+    except (OSError, ValueError):
+        return None
+    try:
+        if not resolved.is_relative_to(user_root):
+            return None
+    except AttributeError:  # Python < 3.9
+        if user_root not in resolved.parents and resolved != user_root:
+            return None
+    return resolved
 
-def resolve_download_path(rel_path: Optional[str], user_id: Optional[str] = None) -> Optional[Path]:
-    """Safely resolve a relative path inside the user's root directory, preventing directory traversal."""
+
+def resolve_download_path(rel_path: Optional[str], user_id: Optional[str] = None, role: Optional[str] = None) -> Optional[Path]:
+    """Safely resolve a relative path inside the owner's root directory, preventing directory traversal."""
     if not rel_path:
         return None
-    import urllib.parse
     user_root = get_user_root(user_id).resolve()
 
-    # Generate candidate paths (raw, unquoted, double-unquoted)
+    # Candidate spellings: as sent and percent-decoded (clients may double-encode names containing '%').
     candidates = [rel_path]
     unq = urllib.parse.unquote(rel_path)
     if unq != rel_path:
         candidates.append(unq)
-    unq2 = urllib.parse.unquote(unq)
-    if unq2 not in candidates:
-        candidates.append(unq2)
 
+    first_valid = None
     for cand in candidates:
-        safe_rel = cand.strip("/\\")
-        try:
-            resolved = (user_root / safe_rel).resolve()
-            try:
-                is_safe = resolved.is_relative_to(user_root)
-            except AttributeError:
-                is_safe = (user_root in resolved.parents or resolved == user_root)
-
-            if is_safe and resolved.exists():
-                return resolved
-        except Exception:
-            pass
-
-    # Fallback to unquoted resolved path even if not existing yet (e.g. for new output files)
-    try:
-        resolved = (user_root / unq.strip("/\\")).resolve()
-        try:
-            is_safe = resolved.is_relative_to(user_root)
-        except AttributeError:
-            is_safe = (user_root in resolved.parents or resolved == user_root)
-
-        if is_safe:
+        resolved = _resolve_inside(user_root, cand)
+        if resolved is None:
+            continue
+        if resolved.exists():
             return resolved
-    except Exception:
-        pass
-    return None
+        if first_valid is None:
+            first_valid = resolved
+
+    # Safe location even if it does not exist yet (e.g. for new output files)
+    return first_valid
+
+
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".gif"}
+AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".flac", ".opus", ".aac", ".ogg"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS
+
+
+def build_resolution_options(formats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Resolution tiers found in yt-dlp `formats`, each with an estimated download size (video + best audio)."""
+    detected_tiers = set()
+    video_only_size: Dict[int, int] = {}
+    combined_size: Dict[int, int] = {}
+    audio_best_size = 0
+    for f in formats:
+        h = f.get("height")
+        w = f.get("width")
+        vcodec = f.get("vcodec", "")
+        acodec = f.get("acodec", "")
+        ext = f.get("ext", "")
+        size = int(f.get("filesize") or f.get("filesize_approx") or 0)
+        if vcodec == "none" and acodec and acodec != "none":
+            audio_best_size = max(audio_best_size, size)
+        if h and isinstance(h, int) and h >= 144 and vcodec and vcodec != "none" and ext != "mhtml":
+            tier = get_resolution_tier(w, h)
+            if tier:
+                detected_tiers.add(tier)
+                if acodec and acodec != "none":
+                    combined_size[tier] = max(combined_size.get(tier, 0), size)
+                else:
+                    video_only_size[tier] = max(video_only_size.get(tier, 0), size)
+
+    options = []
+    for h in sorted(detected_tiers, reverse=True):
+        label = f"{h}p"
+        if h >= 4320:
+            label += " (8K Ultra HD)"
+        elif h >= 2160:
+            label += " (4K Ultra HD)"
+        elif h >= 1440:
+            label += " (2K Quad HD)"
+        elif h >= 1080:
+            label += " (Full HD 1080p)"
+        elif h >= 720:
+            label += " (HD 720p)"
+        video_part = video_only_size.get(h, 0)
+        estimated = max(combined_size.get(h, 0), (video_part + audio_best_size) if video_part else 0)
+        options.append({"height": h, "label": label, "filesize": estimated or None})
+    return options
+
+
+def _thumb_url(rel_posix: str) -> str:
+    return "/api/thumbnail/" + urllib.parse.quote(rel_posix, safe="/")
+
+
+def _rel_posix(path: Path, base_dir: Path) -> str:
+    try:
+        return path.relative_to(base_dir).as_posix()
+    except ValueError:
+        return path.name
 
 
 def get_file_metadata(filepath: Path, base_dir: Optional[Path] = None) -> Dict[str, Any]:
-    global _meta_cache
     if base_dir is None:
         base_dir = DOWNLOADS_DIR
-    try:
-        rel_path = str(filepath.relative_to(base_dir))
-    except Exception:
-        rel_path = filepath.name
+    rel_path = _rel_posix(filepath, base_dir)
+    cache_key = _cache_key(filepath)
 
-    fn = rel_path
     try:
         stat = filepath.stat()
         mtime = stat.st_mtime
@@ -333,21 +679,25 @@ def get_file_metadata(filepath: Path, base_dir: Optional[Path] = None) -> Dict[s
         mtime = 0
         size_bytes = 0
 
-    if fn in _meta_cache and _meta_cache[fn].get("mtime") == mtime:
-        cached = dict(_meta_cache[fn])
+    in_playlist = filepath.parent != base_dir
+
+    with _meta_lock:
+        cached_entry = _meta_cache.get(cache_key)
+        if cached_entry and cached_entry.get("mtime") == mtime:
+            cached = dict(cached_entry)
+        else:
+            cached = None
+
+    if cached is not None:
+        cached["filename"] = rel_path
         cached["size_bytes"] = size_bytes
         cached["size_str"] = format_size(size_bytes)
-        if "playlist_index" not in cached or cached["playlist_index"] is None:
-            p_idx = None
-            if filepath.parent != base_dir:
-                m_idx = re.match(r"^(\d+)[\.\s_-]", filepath.name)
-                if m_idx:
-                    try:
-                        p_idx = int(m_idx.group(1))
-                    except ValueError:
-                        pass
-            cached["playlist_index"] = p_idx
-            _meta_cache[fn]["playlist_index"] = p_idx
+        cached["thumbnail_url"] = _thumb_url(rel_path)
+        cached["is_in_playlist"] = in_playlist
+        if cached.get("playlist_index") is None and in_playlist:
+            m_idx = re.match(r"^(\d+)[\.\s_-]", filepath.name)
+            if m_idx:
+                cached["playlist_index"] = int(m_idx.group(1))
         return cached
 
     # Parse title and bracketed tag from filename
@@ -355,13 +705,10 @@ def get_file_metadata(filepath: Path, base_dir: Optional[Path] = None) -> Dict[s
     clean_title = m.group(1).strip() if m else filepath.stem
     bracket_tag = m.group(2).strip() if (m and m.group(2)) else ""
 
-    video_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".gif"}
-    audio_exts = {".mp3", ".m4a", ".wav", ".flac", ".opus", ".aac", ".ogg"}
-    image_exts = {".jpg", ".jpeg", ".png", ".webp"}
     ext = filepath.suffix.lower()
-    is_video = ext in video_exts
-    is_audio = ext in audio_exts
-    is_image = ext in image_exts
+    is_video = ext in VIDEO_EXTS
+    is_audio = ext in AUDIO_EXTS
+    is_image = ext in IMAGE_EXTS
 
     duration = 0.0
     height = None
@@ -441,18 +788,13 @@ def get_file_metadata(filepath: Path, base_dir: Optional[Path] = None) -> Dict[s
 
     playlist_title = None
     playlist_folder = None
-    is_in_playlist = False
     playlist_index = None
-    if filepath.parent != DOWNLOADS_DIR:
-        is_in_playlist = True
+    if in_playlist:
         playlist_folder = filepath.parent.name
         playlist_title = playlist_folder
         idx_match = re.match(r"^(\d+)[\.\s_-]", filepath.name)
         if idx_match:
-            try:
-                playlist_index = int(idx_match.group(1))
-            except ValueError:
-                pass
+            playlist_index = int(idx_match.group(1))
         meta_file = filepath.parent / ".playlist_meta.json"
         if meta_file.exists():
             try:
@@ -470,7 +812,7 @@ def get_file_metadata(filepath: Path, base_dir: Optional[Path] = None) -> Dict[s
         "quality_tag": quality_tag,
         "duration_seconds": round(duration, 1),
         "duration_str": duration_str,
-        "thumbnail_url": f"/api/thumbnail/{rel_path}",
+        "thumbnail_url": _thumb_url(rel_path),
         "size_bytes": size_bytes,
         "size_str": format_size(size_bytes),
         "created_at": mtime,
@@ -484,37 +826,79 @@ def get_file_metadata(filepath: Path, base_dir: Optional[Path] = None) -> Dict[s
         "mtime": mtime,
         "playlist_name": playlist_title,
         "playlist_folder": playlist_folder,
-        "is_in_playlist": is_in_playlist,
+        "is_in_playlist": in_playlist,
         "playlist_index": playlist_index
     }
-    _meta_cache[fn] = info
+    with _meta_lock:
+        _meta_cache[cache_key] = info
     _save_meta_cache()
-    return info
+    return dict(info)
+
+
+_thumb_slots = threading.BoundedSemaphore(max(1, int(os.getenv("MEDIAPULL_THUMB_WORKERS", "2"))))
+
+
+def _ffmpeg_to_file(input_args: List[str], out_path: Path, min_size: int = 1, timeout: float = 15) -> bool:
+    """Run ffmpeg into a temp file and atomically move it into place (no half-written thumbnails)."""
+    tmp = out_path.with_name(f"{out_path.stem}.{os.getpid()}.{threading.get_ident()}.tmp{out_path.suffix}")
+    try:
+        with _thumb_slots:
+            subprocess.run(
+                ["ffmpeg", "-nostdin", "-y", *input_args, str(tmp)],
+                capture_output=True,
+                timeout=timeout,
+            )
+        if tmp.exists() and tmp.stat().st_size >= min_size:
+            os.replace(tmp, out_path)
+            return True
+    except Exception:
+        pass
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return False
+
+
+def _probe_duration(filepath: Path) -> float:
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(filepath)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5
+        )
+        if proc.stdout.strip():
+            return float(proc.stdout.strip())
+    except Exception:
+        pass
+    return 0.0
+
 
 def get_or_create_thumbnail(filename: str, user_id: Optional[str] = None) -> Optional[Path]:
     filepath = resolve_download_path(filename, user_id)
     if not filepath or not filepath.exists():
         return None
+    user_root = get_user_root(user_id).resolve()
 
     # 1. Directory requested (e.g. playlist folder thumbnail)
     if filepath.is_dir():
         cover_path = filepath / ".cover.jpg"
         if cover_path.exists() and cover_path.stat().st_size > 500:
             return cover_path
+        entries = sorted(filepath.glob("*"))
         # Look for companion images or existing images
-        for cand in sorted(filepath.glob("*")):
+        for cand in entries:
             if cand.is_file() and not cand.name.startswith(".") and cand.suffix.lower() in [".webp", ".jpg", ".png"]:
-                try:
-                    subprocess.run(["ffmpeg", "-y", "-i", str(cand), "-vf", "scale=640:-1", str(cover_path)], capture_output=True, timeout=5)
-                    if cover_path.exists() and cover_path.stat().st_size > 500:
-                        return cover_path
-                except Exception:
-                    pass
+                if _ffmpeg_to_file(["-i", str(cand), "-vf", "scale=640:-1"], cover_path, min_size=501):
+                    return cover_path
         # Fallback to first video thumbnail
-        user_root = get_user_root(user_id)
-        for v in sorted(filepath.glob("*")):
+        for v in entries:
             if v.is_file() and not v.name.startswith(".") and v.suffix.lower() in {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv"}:
-                t = get_or_create_thumbnail(str(v.relative_to(user_root)), user_id=user_id)
+                t = get_or_create_thumbnail(_rel_posix(v, user_root), user_id=user_id)
                 if t and t.exists():
                     try:
                         shutil.copyfile(t, cover_path)
@@ -523,28 +907,22 @@ def get_or_create_thumbnail(filename: str, user_id: Optional[str] = None) -> Opt
                         pass
         return None
 
-    user_prefix = user_id or "kexiky"
-    safe_key = hashlib.md5(f"{user_prefix}:{filename.strip('/\\')}".encode("utf-8")).hexdigest()
-    thumb_path = THUMBNAILS_DIR / f"{safe_key}.jpg"
-    if thumb_path.exists() and thumb_path.stat().st_size > 1500:
-        return thumb_path
-
     # If it is an explicit cover file inside a subfolder
     if filepath.name.startswith(".cover"):
         return filepath
 
-    # Check companion webp or jpg in the same folder as the media
+    rel_posix = _rel_posix(filepath, user_root)
+    thumb_path = THUMBNAILS_DIR / thumbnail_cache_name(user_id, rel_posix)
+    if thumb_path.exists() and thumb_path.stat().st_size > 1500:
+        return thumb_path
+
+    # Check companion webp or jpg written by yt-dlp next to the media (same stem)
     stem = filepath.stem
-    parent_dir = filepath.parent
-    for cand in parent_dir.iterdir():
-        if cand.is_file() and cand.name.startswith(stem) and cand.suffix.lower() in [".webp", ".jpg", ".png"] and cand != filepath:
-            if cand.stat().st_size > 2000:
-                try:
-                    subprocess.run(["ffmpeg", "-y", "-i", str(cand), "-vf", "scale=640:-1", str(thumb_path)], capture_output=True, timeout=5)
-                    if thumb_path.exists() and thumb_path.stat().st_size > 1500:
-                        return thumb_path
-                except Exception:
-                    pass
+    for cand in filepath.parent.iterdir():
+        if (cand.is_file() and cand != filepath and cand.stem == stem
+                and cand.suffix.lower() in [".webp", ".jpg", ".png"] and cand.stat().st_size > 2000):
+            if _ffmpeg_to_file(["-i", str(cand), "-vf", "scale=640:-1"], thumb_path, min_size=1501):
+                return thumb_path
 
     ext = filepath.suffix.lower()
     image_exts = {".jpg", ".jpeg", ".png", ".webp"}
@@ -552,84 +930,152 @@ def get_or_create_thumbnail(filename: str, user_id: Optional[str] = None) -> Opt
     audio_exts = {".mp3", ".m4a", ".wav", ".flac", ".opus", ".aac", ".ogg"}
 
     if ext in image_exts:
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(filepath), "-vf", "scale='min(640,iw)':-1", str(thumb_path)],
-                capture_output=True,
-                timeout=5
-            )
-            if thumb_path.exists() and thumb_path.stat().st_size > 0:
-                return thumb_path
-        except Exception:
-            pass
+        if _ffmpeg_to_file(["-i", str(filepath), "-vf", "scale='min(640,iw)':-1"], thumb_path):
+            return thumb_path
         return filepath
 
     if ext in video_exts:
         dur = 0.0
-        meta = _meta_cache.get(filename) or _meta_cache.get(filepath.name)
-        if meta and meta.get("duration_seconds"):
-            dur = float(meta["duration_seconds"])
-        else:
-            try:
-                proc = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(filepath)],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=5
-                )
-                if proc.stdout.strip():
-                    dur = float(proc.stdout.strip())
-            except Exception:
-                pass
+        with _meta_lock:
+            meta = _meta_cache.get(_cache_key(filepath))
+            if meta and meta.get("duration_seconds"):
+                dur = float(meta["duration_seconds"])
+        if not dur:
+            dur = _probe_duration(filepath)
 
         seek = min(5.0, dur * 0.15) if dur > 5.0 else max(0.2, dur * 0.4)
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-ss", f"{seek:.2f}", "-i", str(filepath), "-vframes", "1", "-vf", "scale=640:-1", str(thumb_path)],
-                capture_output=True,
-                timeout=5
-            )
-            if not thumb_path.exists() or thumb_path.stat().st_size < 1500:
-                seek2 = min(15.0, dur * 0.25) if dur > 10 else 0.5
-                subprocess.run(
-                    ["ffmpeg", "-y", "-ss", f"{seek2:.2f}", "-i", str(filepath), "-vframes", "1", "-vf", "scale=640:-1", str(thumb_path)],
-                    capture_output=True,
-                    timeout=5
-                )
-            if thumb_path.exists() and thumb_path.stat().st_size > 0:
-                return thumb_path
-        except Exception:
-            pass
+        if _ffmpeg_to_file(["-ss", f"{seek:.2f}", "-i", str(filepath), "-vframes", "1", "-vf", "scale=640:-1"], thumb_path, min_size=1501):
+            return thumb_path
+        seek2 = min(15.0, dur * 0.25) if dur > 10 else 0.5
+        if _ffmpeg_to_file(["-ss", f"{seek2:.2f}", "-i", str(filepath), "-vframes", "1", "-vf", "scale=640:-1"], thumb_path):
+            return thumb_path
 
     elif ext in audio_exts:
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(filepath), "-an", "-vcodec", "copy", str(thumb_path)],
-                capture_output=True,
-                timeout=5
-            )
-            if thumb_path.exists() and thumb_path.stat().st_size > 1000:
-                return thumb_path
-            elif thumb_path.exists():
-                thumb_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if _ffmpeg_to_file(["-i", str(filepath), "-an", "-vcodec", "copy"], thumb_path, min_size=1000):
+            return thumb_path
 
     return None
 
 
+TERMINAL_STATUSES = ("completed", "error", "cancelled")
+ACTIVE_STATUSES = ("queued", "downloading", "converting")
+
+ALLOWED_MODES = {"video", "audio", "photo", "single", "subtitles"}
+ALLOWED_VIDEO_FORMATS = {"mp4", "mkv", "webm", "gif"}
+ALLOWED_AUDIO_FORMATS = {"mp3", "m4a", "wav", "flac", "opus", "aac"}
+ALLOWED_AUDIO_BITRATES = {"320", "256", "192", "160", "128", "96", "64"}
+_TIME_RE = re.compile(r"^\d{1,2}(:\d{1,2}){0,2}(\.\d{1,3})?$|^\d+(\.\d{1,3})?$")
+_LANG_RE = re.compile(r"^[A-Za-z0-9_.*-]{1,20}(,[A-Za-z0-9_.*-]{1,20}){0,9}$")
+
+
+class DownloadLimitError(Exception):
+    """Raised when a user or the server has no capacity for another download."""
+
+
+def _clean_text(value: Optional[str], limit: int, default: str = "") -> str:
+    text = "".join(ch for ch in (value or "") if ch.isprintable())
+    return text.strip()[:limit] or default
+
+
+def normalize_download_options(
+    *, mode: str, quality: str, video_format: str, audio_format: str, audio_quality: str,
+    trim_start: Optional[str], trim_end: Optional[str], subtitles_lang: Optional[str], role: str,
+) -> Dict[str, Any]:
+    """Validate user-controlled download options against whitelists and apply role limits.
+
+    These values end up in yt-dlp arguments and in output file names, so nothing free-form passes through.
+    """
+    mode = (mode or "video").strip().lower()
+    if mode not in ALLOWED_MODES:
+        raise ValueError("Недопустимый режим загрузки")
+    if mode == "single":
+        mode = "video"
+
+    video_format = (video_format or "mp4").strip().lower()
+    if video_format not in ALLOWED_VIDEO_FORMATS:
+        raise ValueError("Недопустимый формат видео")
+    audio_format = (audio_format or "mp3").strip().lower()
+    if audio_format not in ALLOWED_AUDIO_FORMATS:
+        raise ValueError("Недопустимый формат аудио")
+    audio_quality = str(audio_quality or "320").strip().lower().replace("kbps", "").replace("k", "")
+    if audio_quality not in ALLOWED_AUDIO_BITRATES:
+        raise ValueError("Недопустимый битрейт аудио")
+
+    role_cfg = ROLE_CONFIGS.get(role, ROLE_CONFIGS["guest"])
+    max_height = role_cfg.get("max_height") or 4320
+
+    quality_raw = str(quality or "best").strip().lower()
+    if quality_raw == "best":
+        # "Best" is capped by the role's resolution limit.
+        quality = "best" if max_height >= 4320 else str(max_height)
+    else:
+        digits = quality_raw[:-1] if quality_raw.endswith("p") else quality_raw
+        if not digits.isdigit() or not (144 <= int(digits) <= 4320):
+            raise ValueError("Недопустимое качество видео")
+        quality = str(min(int(digits), max_height))
+
+    for label, value in (("начала", trim_start), ("конца", trim_end)):
+        if value and not _TIME_RE.match(value.strip()):
+            raise ValueError(f"Недопустимое время {label} фрагмента")
+    trim_start = trim_start.strip() if trim_start else None
+    trim_end = trim_end.strip() if trim_end else None
+
+    lang = (subtitles_lang or "en").strip()
+    if not _LANG_RE.match(lang):
+        raise ValueError("Недопустимый язык субтитров")
+
+    return {
+        "mode": mode, "quality": quality, "video_format": video_format, "audio_format": audio_format,
+        "audio_quality": audio_quality, "trim_start": trim_start, "trim_end": trim_end, "subtitles_lang": lang,
+    }
+
+
+async def terminate_process(proc: Optional["asyncio.subprocess.Process"], grace: float = 5.0) -> None:
+    """Stop a subprocess and its children, wait for it and reap it (no zombies / orphaned ffmpeg)."""
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            # Kill the whole tree: yt-dlp spawns ffmpeg children that outlive a plain terminate().
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(proc.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        else:
+            proc.terminate()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=grace)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace)
+        except asyncio.TimeoutError:
+            pass
+
+
+def _safe_name(text: Optional[str], limit: int, default: str) -> str:
+    """File/folder name component: no path separators or reserved characters, no leading dots."""
+    cleaned = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", text or "").strip().lstrip(". ")[:limit].strip()
+    return cleaned or default
+
+
 class TaskState:
-    def __init__(self, task_id: str, url: str, title: str = "", format_tag: str = "", playlist_title: Optional[str] = None, user_id: Optional[str] = "kexiky", role: str = "guest"):
+    def __init__(self, task_id: str, url: str, title: str = "", format_tag: str = "", playlist_title: Optional[str] = None, user_id: Optional[str] = CREATOR_USERNAME, role: str = "guest"):
         self.id = task_id
         self.url = url
         self.title = title
         self.format_tag = format_tag
         self.playlist_title = playlist_title
-        self.user_id = user_id or "kexiky"
+        self.user_id = user_id or CREATOR_USERNAME
         self.role = role or "guest"
-        self.status = "queued"  # queued, downloading, converting, completed, error, cancelled
+        self._status = "queued"  # queued, downloading, converting, completed, error, cancelled
+        self.finished_at: Optional[float] = None
         self.progress = 0.0
         self.speed = "0 B/s"
         self.eta = "--:--"
@@ -640,10 +1086,24 @@ class TaskState:
         self.filename: Optional[str] = None
         self.filepath: Optional[str] = None
         self.error: Optional[str] = None
-        self.logs: List[str] = []
+        self.logs = deque(maxlen=200)
         self.created_at = time.time()
+        self.target_dir: Optional[Path] = None
         self.process: Optional[asyncio.subprocess.Process] = None
         self.async_task: Optional[asyncio.Task] = None
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @status.setter
+    def status(self, value: str) -> None:
+        self._status = value
+        if value in TERMINAL_STATUSES:
+            if self.finished_at is None:
+                self.finished_at = time.time()
+        else:
+            self.finished_at = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -659,7 +1119,7 @@ class TaskState:
             "total_str": self.total_str,
             "filename": self.filename,
             "error": self.error,
-            "logs": self.logs[-20:],  # last 20 log lines
+            "logs": list(self.logs)[-20:],  # last 20 log lines
             "created_at": self.created_at,
             "user_id": self.user_id,
         }
@@ -669,6 +1129,8 @@ class DownloaderManager:
     def __init__(self):
         self.tasks: Dict[str, TaskState] = {}
         self._semaphore = None
+        self._info_semaphore = None
+        self._bg_tasks: set = set()
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
@@ -677,30 +1139,68 @@ class DownloaderManager:
             self._semaphore = asyncio.Semaphore(max(1, max_c))
         return self._semaphore
 
+    @property
+    def info_semaphore(self) -> asyncio.Semaphore:
+        if self._info_semaphore is None:
+            self._info_semaphore = asyncio.Semaphore(max(1, int(os.getenv("MAX_CONCURRENT_INFO", "4"))))
+        return self._info_semaphore
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """create_task that keeps a strong reference (the loop only holds weak ones)."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
     def prune_old_tasks(self, max_age_seconds: int = 7200):
         now = time.time()
         to_del = [
             tid for tid, t in self.tasks.items()
-            if t.status in ["completed", "error", "cancelled"] and (now - t.created_at > max_age_seconds)
+            if t.status in TERMINAL_STATUSES and (now - (t.finished_at or t.created_at) > max_age_seconds)
         ]
         for tid in to_del:
             self.tasks.pop(tid, None)
 
-    def get_all_tasks(self) -> List[Dict[str, Any]]:
-        self.prune_old_tasks()
-        return [task.to_dict() for task in sorted(self.tasks.values(), key=lambda t: t.created_at, reverse=True)]
+    def get_task(self, task_id: str) -> Optional[TaskState]:
+        return self.tasks.get(task_id)
 
-    def clear_finished_tasks(self) -> int:
+    def get_all_tasks(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """All tasks, newest first. With `user_id` only that owner's tasks are returned."""
+        self.prune_old_tasks()
+        tasks = [t for t in list(self.tasks.values()) if user_id is None or t.user_id == user_id]
+        return [task.to_dict() for task in sorted(tasks, key=lambda t: t.created_at, reverse=True)]
+
+    def clear_finished_tasks(self, user_id: Optional[str] = None) -> int:
         to_delete = [
-            tid for tid, task in self.tasks.items()
-            if task.status in ["completed", "error", "cancelled"]
+            tid for tid, task in list(self.tasks.items())
+            if task.status in TERMINAL_STATUSES and (user_id is None or task.user_id == user_id)
         ]
         for tid in to_delete:
-            del self.tasks[tid]
+            self.tasks.pop(tid, None)
         return len(to_delete)
 
+    def count_active(self, user_id: str) -> int:
+        return sum(1 for t in list(self.tasks.values()) if t.user_id == user_id and t.status in ACTIVE_STATUSES)
+
+    def active_task_capacity(self, user_id: str, role: str) -> int:
+        """How many more tasks this user may enqueue right now."""
+        limit = ROLE_CONFIGS.get(role, ROLE_CONFIGS["guest"]).get("max_active_tasks") or 10
+        return max(0, limit - self.count_active(user_id))
+
+    async def shutdown(self) -> None:
+        """Stop every running download (called on server shutdown)."""
+        for task in list(self.tasks.values()):
+            if task.status in ACTIVE_STATUSES:
+                self.cancel_task(task.id)
+        pending = [t for t in list(self._bg_tasks) if not t.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=10)
+        flush_meta_cache()
+
+    # --- metadata extraction ---
     async def get_video_info(self, url: str) -> Dict[str, Any]:
         """Extract rich video, photo, carousel, or playlist metadata using yt-dlp and GraphQL."""
+        url = validate_media_url(url)
         normalized_url = normalize_url(url)
         platform_info = detect_platform(url)
 
@@ -794,24 +1294,34 @@ class DownloaderManager:
             except Exception:
                 pass
 
-        cmd = get_ytdlp_cmd() + [
+        cmd = get_ytdlp_cmd() + get_ytdlp_global_args() + [
             "--dump-single-json",
             "--no-warnings",
             "--no-update",
             "--geo-bypass",
             "--flat-playlist",
-            normalized_url
+            "--socket-timeout", "30",
+            "--", normalized_url
         ]
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
+        info_timeout = float(os.getenv("MEDIAPULL_INFO_TIMEOUT", "90"))
+        async with self.info_semaphore:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=info_timeout)
+            except asyncio.TimeoutError:
+                await terminate_process(proc)
+                raise ValueError("Сервис не ответил вовремя. Попробуйте позже.")
+            except asyncio.CancelledError:
+                await terminate_process(proc)
+                raise
 
         if proc.returncode != 0:
-            err_msg = stderr.decode(errors="replace").strip()
+            err_msg = stderr.decode(errors="replace").strip()[-800:]
             # If Instagram video and yt-dlp failed, try direct video stream from GraphQL
             if "instagram.com" in url.lower():
                 try:
@@ -917,35 +1427,7 @@ class DownloaderManager:
         thumbnail_url = thumbnails[-1].get("url") if thumbnails else raw_data.get("thumbnail", "")
 
         # Extract available heights / resolutions (supporting 16:9, widescreen 2:1/21:9 & vertical)
-        detected_tiers = set()
-        formats = raw_data.get("formats") or []
-        for f in formats:
-            h = f.get("height")
-            w = f.get("width")
-            vcodec = f.get("vcodec", "")
-            ext = f.get("ext", "")
-            if h and isinstance(h, int) and h >= 144 and vcodec and vcodec != "none" and ext != "mhtml":
-                tier = get_resolution_tier(w, h)
-                if tier:
-                    detected_tiers.add(tier)
-
-        sorted_heights = sorted(list(detected_tiers), reverse=True)
-
-        # Standard preset resolutions
-        resolution_options = []
-        for h in sorted_heights:
-            label = f"{h}p"
-            if h >= 4320:
-                label += " (8K Ultra HD)"
-            elif h >= 2160:
-                label += " (4K Ultra HD)"
-            elif h >= 1440:
-                label += " (2K Quad HD)"
-            elif h >= 1080:
-                label += " (Full HD 1080p)"
-            elif h >= 720:
-                label += " (HD 720p)"
-            resolution_options.append({"height": h, "label": label})
+        resolution_options = build_resolution_options(raw_data.get("formats") or [])
 
         # Extract subtitles
         subs_list = []
@@ -996,22 +1478,14 @@ class DownloaderManager:
         cover_file = target_dir / ".cover.jpg"
         if cover_file.exists() and cover_file.stat().st_size > 1000:
             return
+
         def download_cover():
             try:
-                content = None
-                s = cffi_requests.Session(impersonate="chrome124") if cffi_requests else None
-                if s:
-                    r = s.get(thumb_url, timeout=12)
-                    if r.status_code == 200:
-                        content = r.content
-                if not content:
-                    import urllib.request
-                    req = urllib.request.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=12) as resp:
-                        content = resp.read()
-                if content and len(content) > 500:
-                    with open(cover_file, "wb") as f:
-                        f.write(content)
+                content = safe_fetch_bytes(thumb_url, max_bytes=MAX_IMAGE_BYTES, timeout=12)
+                if len(content) > 500 and looks_like_image(content):
+                    tmp = cover_file.with_name(".cover.tmp")
+                    tmp.write_bytes(content)
+                    os.replace(tmp, cover_file)
             except Exception:
                 pass
         await asyncio.to_thread(download_cover)
@@ -1038,36 +1512,70 @@ class DownloaderManager:
         playlist_thumbnail: Optional[str] = None,
         is_photo: bool = False,
         photo_url: Optional[str] = None,
-        user_id: Optional[str] = "kexiky",
+        user_id: Optional[str] = CREATOR_USERNAME,
         role: str = "guest"
     ) -> TaskState:
-        if is_photo or mode == "photo":
+        """Validate the request and queue a download. Raises ValueError (bad input) or DownloadLimitError."""
+        url = validate_media_url(url)
+        opts = normalize_download_options(
+            mode=mode, quality=quality, video_format=video_format, audio_format=audio_format,
+            audio_quality=audio_quality, trim_start=trim_start, trim_end=trim_end,
+            subtitles_lang=subtitles_lang, role=role,
+        )
+        mode = opts["mode"]
+        is_photo = bool(is_photo or mode == "photo")
+        if is_photo:
+            mode = "photo"
+        photo_url = validate_media_url(photo_url) if photo_url else None
+        try:
+            playlist_thumbnail = validate_media_url(playlist_thumbnail) if playlist_thumbnail else None
+        except ValueError:
+            playlist_thumbnail = None  # a bad cover must not fail the download itself
+        title = _clean_text(title, 200, "Media Download")
+        playlist_title = _clean_text(playlist_title, 120) or None
+        if playlist_index is not None:
+            playlist_index = max(0, min(int(playlist_index), 9999))
+
+        if task_id in self.tasks:
+            raise ValueError("Задача с таким идентификатором уже существует")
+        if not is_temp_user(user_id) and self.active_task_capacity(user_id or CREATOR_USERNAME, role) <= 0:
+            raise DownloadLimitError("Достигнут лимит одновременных загрузок для вашего тарифа. Дождитесь завершения текущих.")
+        try:
+            if shutil.disk_usage(DOWNLOADS_DIR).free < MIN_FREE_DISK_BYTES:
+                raise DownloadLimitError("На сервере недостаточно свободного места. Попробуйте позже.")
+        except OSError:
+            pass
+
+        if is_photo:
             format_tag = "JPG Фото"
+        elif mode == "subtitles":
+            format_tag = f"Субтитры {opts['subtitles_lang']}"
         elif mode == "video":
-            if video_format == "gif":
+            if opts["video_format"] == "gif":
                 format_tag = "GIF Анимация"
             else:
-                q_label = f"{quality}p" if quality.isdigit() else ("Best" if quality == "best" else quality.upper())
-                format_tag = f"{q_label} {video_format.upper()}"
+                q = opts["quality"]
+                q_label = f"{q}p" if q.isdigit() else "Best"
+                format_tag = f"{q_label} {opts['video_format'].upper()}"
         else:
-            format_tag = f"{audio_quality}kbps {audio_format.upper()}"
+            format_tag = f"{opts['audio_quality']}kbps {opts['audio_format'].upper()}"
 
         state = TaskState(task_id, url, title, format_tag=format_tag, playlist_title=playlist_title, user_id=user_id, role=role)
         self.tasks[task_id] = state
 
         # Run background async download task
-        state.async_task = asyncio.create_task(
+        state.async_task = self._spawn(
             self._execute_download(
                 state,
                 mode=mode,
-                quality=quality,
-                video_format=video_format,
-                audio_format=audio_format,
-                audio_quality=audio_quality,
-                trim_start=trim_start,
-                trim_end=trim_end,
+                quality=opts["quality"],
+                video_format=opts["video_format"],
+                audio_format=opts["audio_format"],
+                audio_quality=opts["audio_quality"],
+                trim_start=opts["trim_start"],
+                trim_end=opts["trim_end"],
                 download_subtitles=download_subtitles,
-                subtitles_lang=subtitles_lang,
+                subtitles_lang=opts["subtitles_lang"],
                 embed_subtitles=embed_subtitles,
                 embed_thumbnail=embed_thumbnail,
                 split_chapters=split_chapters,
@@ -1079,6 +1587,11 @@ class DownloaderManager:
             )
         )
         return state
+
+    def _fail(self, state: TaskState, message: str) -> None:
+        state.status = "error"
+        state.error = message
+        state.logs.append(f"[Ошибка] {message}")
 
     async def _execute_download(
         self,
@@ -1101,566 +1614,599 @@ class DownloaderManager:
         is_photo: bool = False,
         photo_url: Optional[str] = None
     ):
-        from app.database import ROLE_CONFIGS
-        role = getattr(state, "role", "guest")
+        role = state.role
         role_cfg = ROLE_CONFIGS.get(role, ROLE_CONFIGS["guest"])
         limit_bytes = role_cfg.get("storage_limit_bytes")
-        if limit_bytes:
-            current_usage = get_user_disk_usage(state.user_id, role)["total_bytes"]
-            if current_usage >= limit_bytes:
-                state.status = "error"
-                state.error = f"Превышена квота хранилища для тарифа {role_cfg['title']} ({role_cfg['storage_limit_display']}). Освободите место в файлах."
-                state.logs.append(f"[Ошибка] Превышена квота хранилища: {role_cfg['storage_limit_display']}")
-                return
-
         user_root = get_user_root(state.user_id, role)
-        target_dir = user_root
-        prefix = ""
-        if playlist_title:
-            clean_folder = re.sub(r'[\\/*?:"<>|]', "", playlist_title).strip()[:80] or "Плейлист"
-            target_dir = user_root / clean_folder
-            target_dir.mkdir(parents=True, exist_ok=True)
-            cover_file = target_dir / ".cover.jpg"
-            meta_file = target_dir / ".playlist_meta.json"
-            if not meta_file.exists():
-                try:
-                    with open(meta_file, "w", encoding="utf-8") as f:
-                        json.dump({
-                            "title": playlist_title,
-                            "created_at": time.time(),
-                            "cover_file": ".cover.jpg"
-                        }, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
-            if playlist_thumbnail and not cover_file.exists():
-                asyncio.create_task(self._save_playlist_cover(target_dir, playlist_thumbnail))
-
-            if playlist_index is not None:
-                prefix = f"{playlist_index:02d}. "
-
-        # Photo download branch
-        if is_photo or mode == "photo":
-            state.status = "downloading"
-            state.logs.append("Скачивание фотографии в оригинальном разрешении...")
-            img_target_url = photo_url
-            if not img_target_url or "instagram.com/p/" in img_target_url or "instagram.com/reel/" in img_target_url:
-                try:
-                    ig_info = extract_instagram_post(state.url)
-                    if ig_info:
-                        cands = ig_info.get("image_versions2", {}).get("candidates", [])
-                        if cands:
-                            img_target_url = cands[0]["url"]
-                        elif ig_info.get("display_uri"):
-                            img_target_url = ig_info["display_uri"]
-                except Exception:
-                    pass
-
-            if not img_target_url:
-                img_target_url = state.url
-
-            clean_name = re.sub(r'[\\/*?:"<>|]', "", state.title).strip()[:120] or "photo"
-            out_file = target_dir / f"{prefix}{clean_name} [JPG].jpg"
-
-            def fetch_img():
-                content = None
-                s = cffi_requests.Session(impersonate="chrome124") if cffi_requests else None
-                if s:
-                    r = s.get(img_target_url, timeout=20)
-                    if r.status_code == 200:
-                        content = r.content
-                if not content:
-                    import urllib.request
-                    req = urllib.request.Request(img_target_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=20) as resp:
-                        content = resp.read()
-                if not content or content.startswith(b"<!DOCTYPE") or content.startswith(b"<html"):
-                    raise ValueError("Не удалось получить валидное изображение (получен HTML вместо картинки)")
-                with open(out_file, "wb") as f:
-                    f.write(content)
-
-            try:
-                await asyncio.to_thread(fetch_img)
-                state.status = "completed"
-                state.progress = 100.0
-                state.filepath = str(out_file)
-                try:
-                    state.filename = str(out_file.relative_to(user_root))
-                except Exception:
-                    state.filename = out_file.name
-                state.downloaded_str = format_size(out_file.stat().st_size)
-                get_file_metadata(out_file, base_dir=user_root)
-                get_or_create_thumbnail(state.filename, user_id=state.user_id)
-                state.logs.append(f"Фото успешно сохранено: {state.filename}")
-                return
-            except Exception as e_img:
-                state.status = "error"
-                state.error = f"Ошибка скачивания фото: {str(e_img)}"
-                state.logs.append(state.error)
-                return
-
-        state.status = "queued"
         state.logs.append("В очереди загрузок...")
 
         try:
             async with self.semaphore:
                 if state.status == "cancelled":
                     return
-
                 state.status = "downloading"
-                state.logs.append(f"Инициализация скачивания: {state.url}")
 
-                # Format filename template with quality / bitrate
-                if mode == "audio":
-                    out_template = str(target_dir / f"{prefix}%(title).150B [{audio_quality}kbps].%(ext)s")
-                else:
-                    if video_format == "gif":
-                        out_template = str(target_dir / f"{prefix}%(title).150B [GIF_TEMP].%(ext)s")
-                    elif quality != "best":
-                        out_template = str(target_dir / f"{prefix}%(title).150B [{quality}p].%(ext)s")
-                    else:
-                        out_template = str(target_dir / f"{prefix}%(title).150B [%(height)sp].%(ext)s")
+                # Quota is checked when the download actually starts (a batch queued all at once
+                # would otherwise pass the check together) and caps the size of this very download.
+                max_bytes = None
+                if limit_bytes:
+                    usage = await asyncio.to_thread(get_user_disk_usage, state.user_id, role, False)
+                    max_bytes = limit_bytes - usage["total_bytes"]
+                    if max_bytes <= 0:
+                        self._fail(state, f"Превышена квота хранилища для тарифа {role_cfg['title']} ({role_cfg['storage_limit_display']}). Освободите место в файлах.")
+                        return
 
-                cmd = get_ytdlp_cmd() + [
-                    "--no-update",
-                    "--no-warnings",
-                    "--newline",
-                    "--progress",
-                    "--geo-bypass",
-                    "-o", out_template,
-                    "--progress-template", "%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_estimate_str)s",
-                    "--write-thumbnail",
-                    "--no-playlist",
-                    "--retries", "10",
-                    "--fragment-retries", "10",
-                    "--file-access-retries", "3"
-                ]
-
-                # Mode setup
-                if mode == "audio":
-                    cmd.extend([
-                        "-x",
-                        "--audio-format", audio_format,
-                        "--audio-quality", "0" if audio_quality == "320" else f"{audio_quality}K",
-                    ])
-                    if embed_thumbnail:
-                        cmd.extend(["--embed-thumbnail", "--add-metadata"])
-                else:
-                    # Video mode
-                    if quality == "best":
-                        if video_format == "mp4":
-                            format_spec = (
-                                "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/"
-                                "bestvideo[vcodec^=avc]+bestaudio/"
-                                "bestvideo+bestaudio[acodec^=mp4a]/"
-                                "bestvideo+bestaudio/best"
-                            )
-                        else:
-                            format_spec = "bestvideo+bestaudio/best"
-                    else:
+                target_dir = user_root
+                prefix = ""
+                if playlist_title:
+                    clean_folder = _safe_name(playlist_title, 80, "Плейлист")
+                    target_dir = user_root / clean_folder
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    cover_file = target_dir / ".cover.jpg"
+                    meta_file = target_dir / ".playlist_meta.json"
+                    if not meta_file.exists():
                         try:
-                            h = int(str(quality).lower().replace("p", "").strip())
-                            w = int(h * 16 / 9) + 60
-                            if video_format == "mp4":
-                                format_spec = (
-                                    f"bestvideo[height<={h}][vcodec^=avc]+bestaudio[acodec^=mp4a]/"
-                                    f"bestvideo[height<={h}][vcodec^=avc]+bestaudio/"
-                                    f"bestvideo[height<={h}]+bestaudio[acodec^=mp4a]/"
-                                    f"bestvideo[height<={h}]+bestaudio/"
-                                    f"bestvideo[width<={w}][vcodec^=avc]+bestaudio/"
-                                    f"bestvideo[width<={w}]+bestaudio/"
-                                    f"best[height<={h}]/best"
-                                )
-                            else:
-                                format_spec = (
-                                    f"bestvideo[height<={h}]+bestaudio/"
-                                    f"bestvideo[width<={w}]+bestaudio/"
-                                    f"best[height<={h}]/best"
-                                )
-                        except ValueError:
-                            format_spec = "bestvideo+bestaudio/best"
+                            with open(meta_file, "w", encoding="utf-8") as f:
+                                json.dump({
+                                    "title": playlist_title,
+                                    "created_at": time.time(),
+                                    "cover_file": ".cover.jpg"
+                                }, f, ensure_ascii=False, indent=2)
+                        except Exception:
+                            pass
+                    if playlist_thumbnail and not cover_file.exists():
+                        self._spawn(self._save_playlist_cover(target_dir, playlist_thumbnail))
 
-                    cmd.extend(["-f", format_spec])
+                    if playlist_index is not None:
+                        prefix = f"{playlist_index:02d}. "
+                state.target_dir = target_dir
 
-                    # Container format
-                    if video_format in ["mp4", "mkv", "webm"]:
-                        cmd.extend(["--merge-output-format", video_format])
-                    elif video_format == "gif":
-                        cmd.extend(["--merge-output-format", "mp4"])
+                if is_photo or mode == "photo":
+                    await self._download_photo(state, user_root, target_dir, prefix, photo_url, min(max_bytes, MAX_IMAGE_BYTES) if max_bytes else MAX_IMAGE_BYTES)
+                    return
 
-                    if embed_thumbnail and video_format != "gif":
-                        cmd.extend(["--embed-thumbnail", "--add-metadata"])
-
-                # Split chapters
-                if split_chapters:
-                    cmd.append("--split-chapters")
-                    state.logs.append("Включено разделение по главам (--split-chapters)")
-
-                # Trim / section selection
-                if trim_start or trim_end:
-                    start_str = trim_start.strip() if trim_start else "00:00:00"
-                    end_str = trim_end.strip() if trim_end else "inf"
-                    cmd.extend([
-                        "--download-sections", f"*{start_str}-{end_str}",
-                        "--force-keyframes-at-cuts"
-                    ])
-                    state.logs.append(f"Обрезка фрагмента: с {start_str} по {end_str}")
-
-                # Subtitles
-                if download_subtitles:
-                    lang = subtitles_lang or "en"
-                    cmd.extend([
-                        "--write-subs",
-                        "--write-auto-subs",
-                        "--sub-langs", lang,
-                        "--convert-subs", "vtt"
-                    ])
-                    if embed_subtitles and mode == "video" and video_format != "gif":
-                        cmd.append("--embed-subs")
-                    state.logs.append(f"Субтитры запрошены для языка: {lang} (формат WebVTT)")
-
-                # Target URL
-                cmd.append(state.url)
-
-                state.logs.append("Команда yt-dlp запущена...")
-                sub_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    env=sub_env
+                await self._run_ytdlp(
+                    state, user_root, target_dir, prefix, max_bytes,
+                    mode=mode, quality=quality, video_format=video_format, audio_format=audio_format,
+                    audio_quality=audio_quality, trim_start=trim_start, trim_end=trim_end,
+                    download_subtitles=download_subtitles, subtitles_lang=subtitles_lang,
+                    embed_subtitles=embed_subtitles, embed_thumbnail=embed_thumbnail, split_chapters=split_chapters,
                 )
-                state.process = proc
-
-                final_filepath = None
-                last_error = None
-                progress_regex = re.compile(r"(\d+(?:\.\d+)?)%\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|\n]+)")
-                merger_regex = re.compile(r'Merging formats into "([^"]+)"')
-
-                # Stream stdout line by line
-                while True:
-                    line_bytes = await proc.stdout.readline()
-                    if not line_bytes:
-                        break
-                    line = line_bytes.decode(errors="replace").strip()
-                    if not line:
-                        continue
-
-                    # Check for progress template: 14.2%| 737.57KiB/s|00:00| 31.00KiB| N/A
-                    match = progress_regex.search(line)
-                    if match:
-                        pct_str, speed_str, eta_str, down_str, tot_str = match.groups()
-                        try:
-                            state.progress = float(pct_str)
-                        except ValueError:
-                            pass
-                        state.speed = speed_str.strip() or state.speed
-                        state.eta = eta_str.strip() or state.eta
-
-                        clean_down = down_str.strip() if down_str and "NA" not in down_str and "N/A" not in down_str else ""
-                        clean_tot = tot_str.strip() if tot_str and "NA" not in tot_str and "N/A" not in tot_str else ""
-
-                        if clean_down:
-                            state.downloaded_str = clean_down.replace("iB", "B")
-
-                        if clean_tot:
-                            state.total_str = clean_tot.replace("iB", "B")
-                        else:
-                            down_bytes = parse_bytes_str(state.downloaded_str)
-                            if down_bytes and state.progress > 2.0:
-                                est_total = down_bytes / (state.progress / 100.0)
-                                state.total_str = f"~{format_size(int(est_total))}"
-                            else:
-                                state.total_str = ""
-                        continue
-
-                    # Check for merge / audio conversion / destinations
-                    merger_match = merger_regex.search(line)
-                    if merger_match:
-                        final_filepath = merger_match.group(1)
-                        state.status = "converting"
-                        state.logs.append(line)
-                    elif "Destination:" in line:
-                        dest = line.split("Destination:", 1)[1].strip()
-                        if not dest.endswith((".part", ".ytdl", ".temp", ".webp")):
-                            final_filepath = dest
-                        state.logs.append(line)
-                    elif "has already been downloaded" in line:
-                        dest = line.replace("[download]", "").replace("has already been downloaded", "").strip()
-                        if not dest.endswith((".part", ".ytdl", ".temp", ".webp")):
-                            final_filepath = dest
-                        state.logs.append(line)
-                    elif "[ExtractAudio]" in line or "[EmbedThumbnail]" in line or "[Metadata]" in line:
-                        state.status = "converting"
-                        state.logs.append(line)
-                    elif "ERROR:" in line or "Error" in line:
-                        last_error = line
-                        state.logs.append(line)
-                    else:
-                        state.logs.append(line)
-
-                await proc.wait()
-
-                if proc.returncode == 0:
-                    # Determine initial downloaded file
-                    if final_filepath and os.path.exists(final_filepath):
-                        state.filepath = final_filepath
-                        try:
-                            state.filename = str(Path(final_filepath).relative_to(user_root))
-                        except Exception:
-                            state.filename = os.path.basename(final_filepath)
-                    else:
-                        candidates = [
-                            p for p in target_dir.glob("*")
-                            if p.is_file() and not p.name.endswith((".part", ".ytdl", ".webp", ".temp", ".json"))
-                        ]
-                        recent = [c for c in candidates if c.stat().st_mtime >= state.created_at - 10]
-                        if recent:
-                            newest = max(recent, key=lambda f: f.stat().st_mtime)
-                        elif candidates:
-                            newest = max(candidates, key=lambda f: f.stat().st_mtime)
-                        else:
-                            newest = None
-
-                        if newest:
-                            state.filepath = str(newest)
-                            try:
-                                state.filename = str(newest.relative_to(user_root))
-                            except Exception:
-                                state.filename = newest.name
-
-                    # Check if GIF conversion is required
-                    if video_format == "gif" and state.filepath and os.path.exists(state.filepath):
-                        state.status = "converting"
-                        state.logs.append("Создание плавной GIF-анимации через 2-pass FFmpeg palette...")
-                        src_p = Path(state.filepath)
-                        gif_name = src_p.stem.replace(" [GIF_TEMP]", "") + " [GIF].gif"
-                        gif_path = target_dir / gif_name
-                        gif_cmd = [
-                            "ffmpeg", "-y", "-i", str(src_p),
-                            "-vf", "fps=15,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
-                            str(gif_path)
-                        ]
-                        try:
-                            p_gif = await asyncio.create_subprocess_exec(*gif_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                            await p_gif.communicate()
-                            if gif_path.exists() and gif_path.stat().st_size > 0:
-                                src_p.unlink(missing_ok=True)
-                                state.filepath = str(gif_path)
-                                try:
-                                    state.filename = str(gif_path.relative_to(user_root))
-                                except Exception:
-                                    state.filename = gif_path.name
-                                state.logs.append(f"GIF успешно сгенерирован: {state.filename}")
-                        except Exception as e_gif:
-                            state.logs.append(f"Ошибка при создании GIF: {str(e_gif)}")
-
-                    state.status = "completed"
-                    state.progress = 100.0
-
-                    if state.filepath and os.path.exists(state.filepath):
-                        try:
-                            state.downloaded_str = format_size(os.path.getsize(state.filepath))
-                            # Pre-cache metadata and thumbnail immediately
-                            p_file = Path(state.filepath)
-                            get_file_metadata(p_file, base_dir=user_root)
-                            get_or_create_thumbnail(state.filename, user_id=state.user_id)
-                        except Exception:
-                            pass
-
-                    state.logs.append(f"Загрузка успешно завершена: {state.filename}")
-                else:
-                    if state.status != "cancelled":
-                        state.status = "error"
-                        state.error = last_error or f"Процесс завершился с кодом {proc.returncode}"
-                        state.logs.append(f"Ошибка скачивания: {state.error}")
 
         except asyncio.CancelledError:
             state.status = "cancelled"
             state.logs.append("Загрузка отменена пользователем.")
-            if state.process and state.process.returncode is None:
-                try:
-                    state.process.terminate()
-                except Exception:
-                    pass
         except Exception as ex:
-            state.status = "error"
-            state.error = str(ex)
-            state.logs.append(f"Исключение: {str(ex)}")
+            self._fail(state, str(ex))
+        finally:
+            # Never leave a child process behind, whatever path got us here.
+            if state.process is not None and state.process.returncode is None:
+                await terminate_process(state.process)
+            if state.status in ("cancelled", "error"):
+                self._cleanup_partials(state)
+            invalidate_usage(state.user_id)
+
+    def _cleanup_partials(self, state: TaskState) -> None:
+        """Remove .part / fragment / intermediate-format leftovers of a cancelled or failed download."""
+        target_dir = state.target_dir
+        if not target_dir or not target_dir.exists():
+            return
+        for other in list(self.tasks.values()):
+            if other is not state and other.target_dir == target_dir and other.status in ("downloading", "converting"):
+                return  # another task is writing into the same folder
+        pattern = re.compile(r"(\.(part|ytdl|temp)$)|(\.part-Frag\d+$)|(\.f\d+\.[A-Za-z0-9]+(\.part)?$)")
+        since = state.created_at - 5
+        try:
+            for p in target_dir.iterdir():
+                if p.is_file() and pattern.search(p.name) and p.stat().st_mtime >= since:
+                    p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    async def _download_photo(self, state: TaskState, user_root: Path, target_dir: Path, prefix: str, photo_url: Optional[str], max_bytes: int) -> None:
+        state.logs.append("Скачивание фотографии в оригинальном разрешении...")
+        img_target_url = photo_url
+        if not img_target_url or "instagram.com/p/" in img_target_url or "instagram.com/reel/" in img_target_url:
+            try:
+                ig_info = await asyncio.to_thread(extract_instagram_post, state.url)
+                if ig_info:
+                    cands = ig_info.get("image_versions2", {}).get("candidates", [])
+                    if cands:
+                        img_target_url = cands[0]["url"]
+                    elif ig_info.get("display_uri"):
+                        img_target_url = ig_info["display_uri"]
+            except Exception:
+                pass
+
+        if not img_target_url:
+            img_target_url = state.url
+
+        clean_name = _safe_name(state.title, 120, "photo")
+        out_file = target_dir / f"{prefix}{clean_name} [JPG].jpg"
+
+        def fetch_img():
+            content = safe_fetch_bytes(img_target_url, max_bytes=max_bytes, timeout=20)
+            if not looks_like_image(content):
+                raise ValueError("Не удалось получить валидное изображение (получен не файл изображения)")
+            tmp = out_file.with_name(out_file.name + ".part")
+            tmp.write_bytes(content)
+            os.replace(tmp, out_file)
+
+        try:
+            await asyncio.to_thread(fetch_img)
+        except Exception as e_img:
+            self._fail(state, f"Ошибка скачивания фото: {e_img}")
+            return
+
+        state.status = "completed"
+        state.progress = 100.0
+        state.filepath = str(out_file)
+        state.filename = _rel_posix(out_file, user_root)
+        state.downloaded_str = format_size(out_file.stat().st_size)
+        await asyncio.to_thread(self._index_file, out_file, user_root, state.user_id, state.filename)
+        state.logs.append(f"Фото успешно сохранено: {state.filename}")
+
+    @staticmethod
+    def _index_file(path: Path, user_root: Path, user_id: Optional[str], filename: Optional[str]) -> None:
+        """Pre-cache metadata and thumbnail right after a download (runs in a worker thread)."""
+        try:
+            get_file_metadata(path, base_dir=user_root)
+            if filename:
+                get_or_create_thumbnail(filename, user_id=user_id)
+        except Exception:
+            pass
+
+    async def _run_ytdlp(
+        self, state: TaskState, user_root: Path, target_dir: Path, prefix: str, max_bytes: Optional[int], *,
+        mode: str, quality: str, video_format: str, audio_format: str, audio_quality: str,
+        trim_start: Optional[str], trim_end: Optional[str], download_subtitles: bool,
+        subtitles_lang: Optional[str], embed_subtitles: bool, embed_thumbnail: bool, split_chapters: bool,
+    ) -> None:
+        state.logs.append(f"Инициализация скачивания: {state.url}")
+
+        # '%' in the destination path would be read as a yt-dlp template field.
+        base = str(target_dir).replace("%", "%%")
+        sep = os.sep
+        pfx = prefix.replace("%", "%%")
+        if mode == "subtitles":
+            out_template = f"{base}{sep}{pfx}%(title).150B [subs].%(ext)s"
+        elif mode == "audio":
+            out_template = f"{base}{sep}{pfx}%(title).150B [{audio_quality}kbps].%(ext)s"
+        elif video_format == "gif":
+            out_template = f"{base}{sep}{pfx}%(title).150B [GIF_TEMP].%(ext)s"
+        elif quality != "best":
+            out_template = f"{base}{sep}{pfx}%(title).150B [{quality}p].%(ext)s"
+        else:
+            out_template = f"{base}{sep}{pfx}%(title).150B [%(height)sp].%(ext)s"
+
+        cmd = get_ytdlp_cmd() + get_ytdlp_global_args() + [
+            "--no-update",
+            "--no-warnings",
+            "--no-mtime",
+            "--newline",
+            "--progress",
+            "--geo-bypass",
+            "-o", out_template,
+            "--progress-template", "%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_estimate_str)s",
+            "--no-playlist",
+            "--retries", "10",
+            "--fragment-retries", "10",
+            "--file-access-retries", "3",
+            "--socket-timeout", "30",
+        ]
+        if max_bytes:
+            cmd.extend(["--max-filesize", str(max_bytes)])
+
+        # Mode setup
+        if mode == "subtitles":
+            cmd.extend([
+                "--skip-download",
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs", subtitles_lang or "en",
+                "--convert-subs", "srt",
+            ])
+        elif mode == "audio":
+            cmd.extend(["--write-thumbnail"])
+            cmd.extend([
+                "-x",
+                "--audio-format", audio_format,
+                "--audio-quality", "0" if audio_quality == "320" else f"{audio_quality}K",
+            ])
+            if embed_thumbnail:
+                cmd.extend(["--embed-thumbnail", "--add-metadata"])
+        else:
+            cmd.append("--write-thumbnail")
+            # Video mode
+            if quality == "best":
+                if video_format == "mp4":
+                    format_spec = (
+                        "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/"
+                        "bestvideo[vcodec^=avc]+bestaudio/"
+                        "bestvideo+bestaudio[acodec^=mp4a]/"
+                        "bestvideo+bestaudio/best"
+                    )
+                else:
+                    format_spec = "bestvideo+bestaudio/best"
+            else:
+                h = int(quality)
+                w = int(h * 16 / 9) + 60
+                if video_format == "mp4":
+                    format_spec = (
+                        f"bestvideo[height<={h}][vcodec^=avc]+bestaudio[acodec^=mp4a]/"
+                        f"bestvideo[height<={h}][vcodec^=avc]+bestaudio/"
+                        f"bestvideo[height<={h}]+bestaudio[acodec^=mp4a]/"
+                        f"bestvideo[height<={h}]+bestaudio/"
+                        f"bestvideo[width<={w}][vcodec^=avc]+bestaudio/"
+                        f"bestvideo[width<={w}]+bestaudio/"
+                        f"best[height<={h}]/best"
+                    )
+                else:
+                    format_spec = (
+                        f"bestvideo[height<={h}]+bestaudio/"
+                        f"bestvideo[width<={w}]+bestaudio/"
+                        f"best[height<={h}]/best"
+                    )
+
+            cmd.extend(["-f", format_spec])
+
+            # Container format
+            if video_format in ["mp4", "mkv", "webm"]:
+                cmd.extend(["--merge-output-format", video_format])
+            elif video_format == "gif":
+                cmd.extend(["--merge-output-format", "mp4"])
+
+            if embed_thumbnail and video_format != "gif":
+                cmd.extend(["--embed-thumbnail", "--add-metadata"])
+
+        # Split chapters
+        if split_chapters:
+            cmd.append("--split-chapters")
+            state.logs.append("Включено разделение по главам (--split-chapters)")
+
+        # Trim / section selection
+        if trim_start or trim_end:
+            start_str = trim_start or "00:00:00"
+            end_str = trim_end or "inf"
+            cmd.extend([
+                "--download-sections", f"*{start_str}-{end_str}",
+                "--force-keyframes-at-cuts"
+            ])
+            state.logs.append(f"Обрезка фрагмента: с {start_str} по {end_str}")
+
+        # Subtitles
+        if download_subtitles and mode != "subtitles":
+            lang = subtitles_lang or "en"
+            cmd.extend([
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs", lang,
+                "--convert-subs", "vtt"
+            ])
+            if embed_subtitles and mode == "video" and video_format != "gif":
+                cmd.append("--embed-subs")
+            state.logs.append(f"Субтитры запрошены для языка: {lang} (формат WebVTT)")
+
+        # Target URL. '--' ends option parsing, so a URL can never be read as a yt-dlp option.
+        cmd.extend(["--", state.url])
+
+        state.logs.append("Команда yt-dlp запущена...")
+        sub_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=sub_env,
+            limit=1024 * 1024,
+        )
+        state.process = proc
+
+        final_filepath = None
+        last_error = None
+        progress_regex = re.compile(r"(\d+(?:\.\d+)?)%\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|\n]+)")
+        merger_regex = re.compile(r'Merging formats into "([^"]+)"')
+        idle_timeout = float(os.getenv("MEDIAPULL_DOWNLOAD_IDLE_TIMEOUT", "900"))
+
+        # Stream stdout line by line
+        while True:
+            try:
+                line_bytes = await asyncio.wait_for(proc.stdout.readline(), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                await terminate_process(proc)
+                self._fail(state, f"yt-dlp не подавал признаков активности {int(idle_timeout)} сек. — загрузка остановлена")
+                return
+            if not line_bytes:
+                break
+            line = line_bytes.decode(errors="replace").strip()
+            if not line:
+                continue
+
+            # Check for progress template: 14.2%| 737.57KiB/s|00:00| 31.00KiB| N/A
+            match = progress_regex.search(line)
+            if match:
+                pct_str, speed_str, eta_str, down_str, tot_str = match.groups()
+                try:
+                    state.progress = float(pct_str)
+                except ValueError:
+                    pass
+                state.speed = speed_str.strip() or state.speed
+                state.eta = eta_str.strip() or state.eta
+
+                clean_down = down_str.strip() if down_str and "NA" not in down_str and "N/A" not in down_str else ""
+                clean_tot = tot_str.strip() if tot_str and "NA" not in tot_str and "N/A" not in tot_str else ""
+
+                if clean_down:
+                    state.downloaded_str = clean_down.replace("iB", "B")
+
+                if clean_tot:
+                    state.total_str = clean_tot.replace("iB", "B")
+                else:
+                    down_bytes = parse_bytes_str(state.downloaded_str)
+                    if down_bytes and state.progress > 2.0:
+                        est_total = down_bytes / (state.progress / 100.0)
+                        state.total_str = f"~{format_size(int(est_total))}"
+                    else:
+                        state.total_str = ""
+                continue
+
+            # Check for merge / audio conversion / destinations
+            merger_match = merger_regex.search(line)
+            if merger_match:
+                final_filepath = merger_match.group(1)
+                state.status = "converting"
+                state.logs.append(line)
+            elif "Destination:" in line:
+                dest = line.split("Destination:", 1)[1].strip()
+                if not dest.endswith((".part", ".ytdl", ".temp", ".webp")):
+                    final_filepath = dest
+                state.logs.append(line)
+            elif "has already been downloaded" in line:
+                dest = line.replace("[download]", "").replace("has already been downloaded", "").strip()
+                if not dest.endswith((".part", ".ytdl", ".temp", ".webp")):
+                    final_filepath = dest
+                state.logs.append(line)
+            elif "[ExtractAudio]" in line or "[EmbedThumbnail]" in line or "[Metadata]" in line:
+                state.status = "converting"
+                state.logs.append(line)
+            elif "ERROR:" in line or "Error" in line:
+                last_error = line
+                state.logs.append(line)
+            else:
+                state.logs.append(line)
+
+        await proc.wait()
+
+        if proc.returncode != 0:
+            if state.status != "cancelled":
+                self._fail(state, last_error or f"Процесс завершился с кодом {proc.returncode}")
+            return
+
+        if mode == "subtitles":
+            found = [
+                p for p in target_dir.glob("*")
+                if p.is_file() and p.suffix.lower() in (".srt", ".vtt") and p.stat().st_mtime >= state.created_at - 10
+            ]
+            found.sort(key=lambda p: (p.suffix.lower() != ".srt", -p.stat().st_mtime))
+            if not found:
+                self._fail(state, "Субтитры для выбранного языка не найдены")
+                return
+            state.filepath = str(found[0])
+            state.filename = _rel_posix(found[0], user_root)
+            state.status = "completed"
+            state.progress = 100.0
+            state.downloaded_str = format_size(found[0].stat().st_size)
+            state.logs.append(f"Субтитры сохранены: {state.filename}")
+            return
+
+        # Determine the downloaded file
+        if final_filepath and os.path.exists(final_filepath):
+            state.filepath = final_filepath
+            state.filename = _rel_posix(Path(final_filepath), user_root)
+        else:
+            candidates = [
+                p for p in target_dir.glob("*")
+                if p.is_file() and not p.name.endswith((".part", ".ytdl", ".webp", ".temp", ".json"))
+            ]
+            recent = [c for c in candidates if c.stat().st_mtime >= state.created_at - 10]
+            if recent:
+                newest = max(recent, key=lambda f: f.stat().st_mtime)
+            elif candidates:
+                newest = max(candidates, key=lambda f: f.stat().st_mtime)
+            else:
+                newest = None
+
+            if newest:
+                state.filepath = str(newest)
+                state.filename = _rel_posix(newest, user_root)
+
+        # Check if GIF conversion is required
+        if video_format == "gif" and state.filepath and os.path.exists(state.filepath):
+            state.status = "converting"
+            state.logs.append("Создание плавной GIF-анимации через 2-pass FFmpeg palette...")
+            src_p = Path(state.filepath)
+            gif_name = src_p.stem.replace(" [GIF_TEMP]", "") + " [GIF].gif"
+            gif_path = target_dir / gif_name
+            gif_cmd = [
+                "ffmpeg", "-nostdin", "-y", "-i", str(src_p),
+                "-vf", "fps=15,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                str(gif_path)
+            ]
+            try:
+                p_gif = await asyncio.create_subprocess_exec(*gif_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                state.process = p_gif
+                try:
+                    await asyncio.wait_for(p_gif.wait(), timeout=600)
+                except asyncio.TimeoutError:
+                    await terminate_process(p_gif)
+                    state.logs.append("Создание GIF прервано по таймауту")
+                if gif_path.exists() and gif_path.stat().st_size > 0 and p_gif.returncode == 0:
+                    src_p.unlink(missing_ok=True)
+                    state.filepath = str(gif_path)
+                    state.filename = _rel_posix(gif_path, user_root)
+                    state.logs.append(f"GIF успешно сгенерирован: {state.filename}")
+            except Exception as e_gif:
+                state.logs.append(f"Ошибка при создании GIF: {e_gif}")
+
+        state.status = "completed"
+        state.progress = 100.0
+
+        if state.filepath and os.path.exists(state.filepath):
+            try:
+                state.downloaded_str = format_size(os.path.getsize(state.filepath))
+            except OSError:
+                pass
+            await asyncio.to_thread(self._index_file, Path(state.filepath), user_root, state.user_id, state.filename)
+
+        state.logs.append(f"Загрузка успешно завершена: {state.filename}")
 
     def cancel_task(self, task_id: str) -> bool:
-        if task_id in self.tasks:
-            task = self.tasks[task_id]
+        """Cancel a task. Returns False only when the task does not exist."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return False
+        if task.status in ACTIVE_STATUSES:
             task.status = "cancelled"
             if task.async_task and not task.async_task.done():
-                try:
-                    task.async_task.cancel()
-                except Exception:
-                    pass
-            if task.process and task.process.returncode is None:
-                try:
-                    task.process.terminate()
-                except Exception:
-                    pass
-            return True
-        return False
+                # The task's own handler stops the subprocess tree and removes partial files.
+                task.async_task.cancel()
+        return True
 
-    def list_history(self, user_id: Optional[str] = "kexiky", role: str = "guest") -> Dict[str, Any]:
+    def list_history(self, user_id: Optional[str] = CREATOR_USERNAME, role: str = "guest") -> Dict[str, Any]:
         """List files and structured playlists for a specific user according to their role."""
         user_root = get_user_root(user_id, role)
         if not user_root.exists():
             return {"files": [], "playlists": []}
 
-        video_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".gif"}
-        audio_exts = {".mp3", ".m4a", ".wav", ".flac", ".opus", ".aac", ".ogg"}
-        image_exts = {".jpg", ".jpeg", ".png", ".webp"}
-        valid_exts = video_exts | audio_exts | image_exts
-
-        is_admin_or_kexiky = (not user_id or user_id == "kexiky" or role == "admin")
+        is_creator_root = (user_root == DOWNLOADS_DIR)
+        owner = CREATOR_USERNAME if is_creator_root else user_id
         now = time.time()
 
-        from app.database import ROLE_CONFIGS
         role_cfg = ROLE_CONFIGS.get(role, ROLE_CONFIGS["guest"])
-        role_ttl = role_cfg.get("ttl_seconds")
-        if is_admin_or_kexiky:
-            role_ttl = None
+        role_ttl = None if is_creator_root else role_cfg.get("ttl_seconds")
         is_permanent = (role_ttl is None)
 
         all_files = []
         playlists_dict: Dict[str, Dict[str, Any]] = {}
 
-        def is_companion_thumbnail(img_p: Path, d: Path) -> bool:
-            if img_p.suffix.lower() not in image_exts:
+        def media_stems(entries: List[Path]) -> tuple:
+            """Stems of media files in a folder, computed once per folder (not once per image)."""
+            stems, cleaned = set(), set()
+            for other in entries:
+                if other.is_file() and (other.suffix.lower() in VIDEO_EXTS | AUDIO_EXTS or other.suffix.lower() in (".part", ".ytdl")):
+                    stems.add(other.stem)
+                    cleaned.add(re.sub(r"\s*\[.*?\]", "", other.stem).strip().lower())
+            return stems, cleaned
+
+        def is_companion_thumbnail(img_p: Path, stems: set, cleaned: set) -> bool:
+            if img_p.suffix.lower() not in IMAGE_EXTS:
                 return False
-            stem = img_p.stem
-            clean_stem = re.sub(r"\s*\[.*?\]", "", stem).strip().lower()
-            for other in d.iterdir():
-                if other.is_file() and other != img_p:
-                    other_ext = other.suffix.lower()
-                    if other_ext in video_exts or other_ext in audio_exts or other_ext in [".part", ".ytdl"]:
-                        other_stem = other.stem
-                        other_clean = re.sub(r"\s*\[.*?\]", "", other_stem).strip().lower()
-                        if stem == other_stem or (clean_stem and clean_stem == other_clean):
-                            return True
-            return False
+            clean_stem = re.sub(r"\s*\[.*?\]", "", img_p.stem).strip().lower()
+            return img_p.stem in stems or bool(clean_stem and clean_stem in cleaned)
+
+        def decorate(meta: Dict[str, Any]) -> Dict[str, Any]:
+            meta["owner"] = owner
+            meta["is_permanent"] = is_permanent
+            if is_permanent:
+                meta["expires_at"] = None
+                meta["ttl_remaining_seconds"] = None
+                meta["ttl_display"] = "♾️ Вечно"
+            else:
+                created = meta.get("created_at", now)
+                expires_at = created + role_ttl
+                meta["expires_at"] = expires_at
+                meta["ttl_remaining_seconds"] = max(0, int(expires_at - now))
+                meta["ttl_display"] = role_cfg.get("ttl_display", "⏳")
+            return meta
+
+        def _nat_key(item):
+            idx = item.get("playlist_index")
+            if idx is not None:
+                return (0, idx, item.get("basename", ""))
+            bname = item.get("basename", "")
+            m_num = re.match(r"^(\d+)", bname)
+            if m_num:
+                return (0, int(m_num.group(1)), bname)
+            return (1, 0, bname.lower())
+
+        root_entries = sorted(user_root.iterdir())
 
         # 1. Scan subdirectories (playlist folders)
-        for folder in sorted(user_root.iterdir()):
-            if is_admin_or_kexiky and folder.name in ["guests", "users"]:
+        for folder in root_entries:
+            if is_creator_root and folder.name in RESERVED_ROOT_DIRS:
                 continue
-            if folder.is_dir() and not folder.name.startswith("."):
-                folder_files = []
-                meta_file = folder / ".playlist_meta.json"
-                playlist_title = folder.name
-                if meta_file.exists():
-                    try:
-                        with open(meta_file, "r", encoding="utf-8") as f:
-                            pdata = json.load(f)
-                            if pdata.get("title"):
-                                playlist_title = pdata["title"]
-                    except Exception:
-                        pass
+            if not folder.is_dir() or folder.name.startswith("."):
+                continue
 
-                def _nat_key(item):
-                    idx = item.get("playlist_index")
-                    if idx is not None:
-                        return (0, idx, item.get("basename", ""))
-                    bname = item.get("basename", "")
-                    m_num = re.match(r"^(\d+)", bname)
-                    if m_num:
-                        return (0, int(m_num.group(1)), bname)
-                    return (1, 0, bname.lower())
+            folder_files = []
+            meta_file = folder / ".playlist_meta.json"
+            playlist_title = folder.name
+            if meta_file.exists():
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        pdata = json.load(f)
+                        if pdata.get("title"):
+                            playlist_title = pdata["title"]
+                except Exception:
+                    pass
 
-                for p in sorted(folder.glob("*"), key=lambda f: f.name):
-                    if p.is_file() and not p.name.startswith("."):
-                        if p.suffix.lower() in valid_exts and not is_companion_thumbnail(p, folder):
-                            meta = get_file_metadata(p, base_dir=user_root)
-                            meta["playlist_name"] = playlist_title
-                            meta["owner"] = "kexiky" if is_admin_or_kexiky else user_id
-                            meta["is_permanent"] = is_permanent
-                            if is_permanent:
-                                meta["expires_at"] = None
-                                meta["ttl_remaining_seconds"] = None
-                                meta["ttl_display"] = "♾️ Вечно"
-                            else:
-                                created = meta.get("created_at", now)
-                                expires_at = created + role_ttl
-                                meta["expires_at"] = expires_at
-                                meta["ttl_remaining_seconds"] = max(0, int(expires_at - now))
-                                meta["ttl_display"] = role_cfg.get("ttl_display", "⏳")
-                            folder_files.append(meta)
-                            all_files.append(meta)
+            entries = sorted(folder.glob("*"), key=lambda f: f.name)
+            stems, cleaned = media_stems(entries)
+            for p in entries:
+                if p.is_file() and not p.name.startswith("."):
+                    if p.suffix.lower() in MEDIA_EXTS and not is_companion_thumbnail(p, stems, cleaned):
+                        meta = decorate(get_file_metadata(p, base_dir=user_root))
+                        meta["playlist_name"] = playlist_title
+                        folder_files.append(meta)
+                        all_files.append(meta)
 
-                folder_files.sort(key=_nat_key)
+            folder_files.sort(key=_nat_key)
+            if not folder_files:
+                continue
 
-                if folder_files:
-                    total_bytes = sum(f.get("size_bytes", 0) for f in folder_files)
-                    total_duration = sum(f.get("duration_seconds", 0) for f in folder_files)
+            total_bytes = sum(f.get("size_bytes", 0) for f in folder_files)
+            total_duration = sum(f.get("duration_seconds", 0) for f in folder_files)
 
-                    # Ensure .cover.jpg exists for this playlist folder
-                    cover_file = folder / ".cover.jpg"
-                    if not cover_file.exists() or cover_file.stat().st_size < 500:
-                        # Try to copy companion webp or frame from first media file
-                        for cand in folder.iterdir():
-                            if cand.is_file() and not cand.name.startswith(".") and cand.suffix.lower() in [".webp", ".jpg", ".png"]:
-                                try:
-                                    subprocess.run(["ffmpeg", "-y", "-i", str(cand), "-vf", "scale=640:-1", str(cover_file)], capture_output=True, timeout=5)
-                                    if cover_file.exists() and cover_file.stat().st_size > 500:
-                                        break
-                                except Exception:
-                                    pass
-                        if not cover_file.exists():
-                            first_vid = next((f for f in folder_files if f.get("is_video")), None)
-                            if first_vid:
-                                t = get_or_create_thumbnail(first_vid["filename"], user_id=user_id)
-                                if t and t.exists():
-                                    try:
-                                        shutil.copyfile(t, cover_file)
-                                    except Exception:
-                                        pass
+            # Ensure .cover.jpg exists for this playlist folder
+            cover_file = folder / ".cover.jpg"
+            if not cover_file.exists() or cover_file.stat().st_size < 500:
+                try:
+                    get_or_create_thumbnail(_rel_posix(folder, user_root), user_id=user_id)
+                except Exception:
+                    pass
 
-                    thumb_url = f"/api/thumbnail/{folder.name}/.cover.jpg" if (cover_file.exists() and cover_file.stat().st_size > 0) else (folder_files[0].get("thumbnail_url", "") if folder_files else "")
-                    first_file_name = folder_files[0]["filename"] if folder_files else ""
+            has_cover = cover_file.exists() and cover_file.stat().st_size > 0
+            thumb_url = (
+                _thumb_url(_rel_posix(cover_file, user_root)) if has_cover
+                else folder_files[0].get("thumbnail_url", "")
+            )
+            first_file_name = folder_files[0]["filename"]
 
-                    playlists_dict[folder.name] = {
-                        "id": folder.name,
-                        "title": playlist_title,
-                        "folder_name": folder.name,
-                        "item_count": len(folder_files),
-                        "video_count": len(folder_files),
-                        "total_size_bytes": total_bytes,
-                        "total_size_str": format_size(total_bytes),
-                        "total_duration_seconds": total_duration,
-                        "total_duration_str": format_duration(total_duration),
-                        "thumbnail_url": thumb_url,
-                        "first_thumbnail_file": first_file_name,
-                        "first_video_file": first_file_name,
-                        "created_at": max((f.get("created_at", 0) for f in folder_files), default=0),
-                        "is_permanent": is_permanent,
-                        "ttl_display": "♾️ Вечно" if is_permanent else role_cfg.get("ttl_display", "⏳"),
-                        "owner": "kexiky" if is_admin_or_kexiky else user_id,
-                        "files": folder_files
-                    }
+            playlists_dict[folder.name] = {
+                "id": folder.name,
+                "title": playlist_title,
+                "folder_name": folder.name,
+                "item_count": len(folder_files),
+                "video_count": len(folder_files),
+                "total_size_bytes": total_bytes,
+                "total_size_str": format_size(total_bytes),
+                "total_duration_seconds": total_duration,
+                "total_duration_str": format_duration(total_duration),
+                "thumbnail_url": thumb_url,
+                "first_thumbnail_file": first_file_name,
+                "first_video_file": first_file_name,
+                "created_at": max((f.get("created_at", 0) for f in folder_files), default=0),
+                "is_permanent": is_permanent,
+                "ttl_display": "♾️ Вечно" if is_permanent else role_cfg.get("ttl_display", "⏳"),
+                "owner": owner,
+                "files": folder_files
+            }
 
         # 2. Scan root files (standalone downloads)
-        for p in user_root.glob("*"):
-            if is_admin_or_kexiky and p.name in ["guests", "users"]:
-                continue
+        root_stems, root_cleaned = media_stems(root_entries)
+        for p in root_entries:
             if p.is_file() and not p.name.startswith("."):
-                if p.suffix.lower() in valid_exts and not is_companion_thumbnail(p, user_root):
-                    meta = get_file_metadata(p, base_dir=user_root)
-                    meta["owner"] = "kexiky" if is_admin_or_kexiky else user_id
-                    meta["is_permanent"] = is_permanent
-                    if is_permanent:
-                        meta["expires_at"] = None
-                        meta["ttl_remaining_seconds"] = None
-                        meta["ttl_display"] = "♾️ Вечно"
-                    else:
-                        created = meta.get("created_at", now)
-                        expires_at = created + role_ttl
-                        meta["expires_at"] = expires_at
-                        meta["ttl_remaining_seconds"] = max(0, int(expires_at - now))
-                        meta["ttl_display"] = role_cfg.get("ttl_display", "⏳")
-                    all_files.append(meta)
+                if p.suffix.lower() in MEDIA_EXTS and not is_companion_thumbnail(p, root_stems, root_cleaned):
+                    all_files.append(decorate(get_file_metadata(p, base_dir=user_root)))
 
         # Sort all files by mtime descending
         all_files.sort(key=lambda f: f.get("created_at", 0), reverse=True)
@@ -1674,52 +2220,44 @@ class DownloaderManager:
     def get_or_create_thumbnail(self, filename: str, user_id: Optional[str] = None) -> Optional[Path]:
         return get_or_create_thumbnail(filename, user_id=user_id)
 
-    def delete_file(self, filename: str, user_id: Optional[str] = None) -> bool:
-        target = resolve_download_path(filename, user_id)
-        user_root = get_user_root(user_id)
-        if not target or not target.exists() or not target.is_file():
-            # Try finding by clean basename in case relative folder wasn't provided or mismatch occurred
-            import urllib.parse
-            base_cand = urllib.parse.unquote(Path(filename).name)
-            for p in user_root.rglob("*"):
-                if p.is_file() and p.name == base_cand:
-                    target = p
-                    break
+    @staticmethod
+    def _find_by_basename(user_root: Path, filename: str) -> Optional[Path]:
+        """Fallback when the client sent only a base name: look in the root and its direct sub-folders."""
+        name = Path(urllib.parse.unquote(filename)).name
+        if not name or name.startswith("."):
+            return None
+        folders = [user_root] + [
+            d for d in user_root.iterdir()
+            if d.is_dir() and not d.name.startswith(".") and not (user_root == DOWNLOADS_DIR and d.name in RESERVED_ROOT_DIRS)
+        ]
+        matches = [d / name for d in folders if (d / name).is_file()]
+        return matches[0] if len(matches) == 1 else None
 
-        if not target or not target.exists() or not target.is_file():
+    def delete_file(self, filename: str, user_id: Optional[str] = None) -> bool:
+        user_root = get_user_root(user_id).resolve()
+        target = resolve_download_path(filename, user_id)
+        if not target or not target.is_file():
+            target = self._find_by_basename(user_root, filename)
+        if not target or not target.is_file():
             return False
 
         parent_dir = target.parent
+        rel_name = _rel_posix(target, user_root)
         target.unlink(missing_ok=True)
 
-        # Remove cached thumbnail
-        safe_key = hashlib.md5(filename.strip("/\\").encode("utf-8")).hexdigest()
-        (THUMBNAILS_DIR / f"{safe_key}.jpg").unlink(missing_ok=True)
-        (THUMBNAILS_DIR / f"{target.name}.jpg").unlink(missing_ok=True)
-        try:
-            rel_name = str(target.relative_to(user_root))
-            safe_rel_key = hashlib.md5(rel_name.strip("/\\").encode("utf-8")).hexdigest()
-            (THUMBNAILS_DIR / f"{safe_rel_key}.jpg").unlink(missing_ok=True)
-        except Exception:
-            rel_name = filename
+        # Remove cached thumbnail and metadata
+        (THUMBNAILS_DIR / thumbnail_cache_name(user_id, rel_name)).unlink(missing_ok=True)
+        with _meta_lock:
+            _meta_cache.pop(_cache_key(target), None)
+        _save_meta_cache()
 
-        # Clean companion webp, vtt, srt, jpg, part in parent_dir
+        # Clean companion webp, vtt, srt, jpg, part next to the file ("<stem>.ext" / "<stem>.<lang>.vtt")
         stem = target.stem
         if parent_dir.exists():
             for cand in parent_dir.iterdir():
-                if cand.is_file() and cand != target:
-                    if cand.name.startswith(stem) and cand.suffix.lower() in [
-                        ".webp", ".jpg", ".jpeg", ".png", ".part", ".ytdl",
-                        ".vtt", ".srt", ".ass"
-                    ]:
+                if cand.is_file() and cand != target and (cand.stem == stem or cand.name.startswith(stem + ".")):
+                    if cand.suffix.lower() in [".webp", ".jpg", ".jpeg", ".png", ".part", ".ytdl", ".vtt", ".srt", ".ass"]:
                         cand.unlink(missing_ok=True)
-
-        # Clear from meta cache
-        global _meta_cache
-        for k in [filename, target.name, rel_name]:
-            if k in _meta_cache:
-                del _meta_cache[k]
-        _save_meta_cache()
 
         # If inside a playlist folder and no more media files remain, remove folder
         if parent_dir != user_root and parent_dir.exists():
@@ -1730,6 +2268,7 @@ class DownloaderManager:
             if not remaining_media:
                 shutil.rmtree(parent_dir, ignore_errors=True)
 
+        invalidate_usage()
         return True
 
     def delete_files_batch(self, filenames: List[str], user_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1740,37 +2279,33 @@ class DownloaderManager:
         return {"deleted_count": deleted_count}
 
     def delete_playlist(self, folder_name: str, user_id: Optional[str] = None) -> bool:
+        user_root = get_user_root(user_id).resolve()
         target = resolve_download_path(folder_name, user_id)
-        user_root = get_user_root(user_id)
-        if not target or not target.exists() or not target.is_dir() or target == user_root:
+        # Only direct, non-internal sub-folders of the owner's root are playlists.
+        if (not target or not target.is_dir() or target == user_root or target.parent != user_root
+                or (user_root == DOWNLOADS_DIR.resolve() and target.name in RESERVED_ROOT_DIRS)):
             return False
 
-        global _meta_cache
         for f in target.glob("*"):
             if f.is_file():
                 try:
-                    rel = str(f.relative_to(user_root))
-                    key = hashlib.md5(rel.encode("utf-8")).hexdigest()
-                    (THUMBNAILS_DIR / f"{key}.jpg").unlink(missing_ok=True)
-                    (THUMBNAILS_DIR / f"{f.name}.jpg").unlink(missing_ok=True)
-                    if rel in _meta_cache:
-                        del _meta_cache[rel]
-                    if f.name in _meta_cache:
-                        del _meta_cache[f.name]
+                    (THUMBNAILS_DIR / thumbnail_cache_name(user_id, _rel_posix(f, user_root))).unlink(missing_ok=True)
+                    with _meta_lock:
+                        _meta_cache.pop(_cache_key(f), None)
                 except Exception:
                     pass
 
         _save_meta_cache()
         shutil.rmtree(target, ignore_errors=True)
+        invalidate_usage()
         return True
 
     def get_file_subtitles(self, filename: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         target = resolve_download_path(filename, user_id)
-        if not target and user_id:
-            target = resolve_download_path(filename, "kexiky")
         if not target or not target.exists() or not target.is_file():
             return []
 
+        quoted_name = urllib.parse.quote(filename, safe="")
         subs = []
         # 1. Embedded subtitles via ffprobe
         try:
@@ -1800,17 +2335,17 @@ class DownloaderManager:
                         "lang": lang,
                         "label": f"{title} ({lang})",
                         "type": "embedded",
-                        "url": f"/api/subtitles-track/{filename}/{idx}.vtt"
+                        "url": f"/api/subtitles-track?filename={quoted_name}&track_id={idx}"
                     })
         except Exception:
             pass
 
-        # 2. Companion external subtitle files
+        # 2. Companion external subtitle files ("<stem>.<lang>.vtt")
         stem = target.stem
         parent_dir = target.parent
         try:
             for cand in parent_dir.iterdir():
-                if cand.is_file() and cand.name.startswith(stem) and cand.suffix.lower() in [".vtt", ".srt"]:
+                if cand.is_file() and cand.name.startswith(stem + ".") and cand.suffix.lower() in [".vtt", ".srt"]:
                     sub_lang = "sub"
                     parts = cand.stem.split(".")
                     if len(parts) > 1:
@@ -1820,7 +2355,7 @@ class DownloaderManager:
                         "lang": sub_lang,
                         "label": f"{sub_lang.upper()} (файл)",
                         "type": "companion",
-                        "url": f"/api/subtitles-track/{filename}/{cand.name}.vtt"
+                        "url": f"/api/subtitles-track?filename={quoted_name}&track_id={urllib.parse.quote(cand.name, safe='')}"
                     })
         except Exception:
             pass
@@ -1829,51 +2364,58 @@ class DownloaderManager:
 
     def extract_subtitle_vtt(self, filename: str, track_id: str, user_id: Optional[str] = None) -> Optional[str]:
         target = resolve_download_path(filename, user_id)
-        if not target and user_id:
-            target = resolve_download_path(filename, "kexiky")
         if not target or not target.exists() or not target.is_file():
             return None
 
-        # Check companion file in same folder or downloads
-        companion_target = target.parent / track_id
-        if not companion_target.exists():
-            companion_target = resolve_download_path(track_id, user_id)
+        track_id = (track_id or "").strip()
+        if track_id.lower().endswith(".vtt.vtt"):
+            track_id = track_id[:-4]
 
-        if companion_target and companion_target.exists() and companion_target.is_file():
-            if companion_target.suffix.lower() == ".vtt":
-                try:
-                    return companion_target.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    pass
-            elif companion_target.suffix.lower() == ".srt":
-                try:
-                    proc = subprocess.run(
-                        ["ffmpeg", "-y", "-i", str(companion_target), "-f", "webvtt", "-"],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=8
-                    )
-                    if proc.returncode == 0:
-                        return proc.stdout
-                except Exception:
-                    pass
+        # Embedded track: a plain stream index
+        if re.fullmatch(r"\d{1,3}", track_id):
+            try:
+                proc = subprocess.run(
+                    ["ffmpeg", "-nostdin", "-y", "-i", str(target), "-map", f"0:{track_id}", "-f", "webvtt", "-"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=8
+                )
+                if proc.returncode == 0:
+                    return proc.stdout
+            except Exception:
+                pass
+            return None
 
-        # Extract embedded track via stream index
-        try:
-            proc = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(target), "-map", f"0:{track_id}", "-f", "webvtt", "-"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=8
-            )
-            if proc.returncode == 0:
-                return proc.stdout
-        except Exception:
-            pass
+        # Companion file: must be a bare file name that sits next to the media file
+        if (not track_id or track_id != Path(track_id).name or "/" in track_id or "\\" in track_id
+                or track_id.startswith(".")):
+            return None
+        companion = target.parent / track_id
+        if not companion.is_file():
+            return None
+        suffix = companion.suffix.lower()
+        if suffix == ".vtt":
+            try:
+                with open(companion, "r", encoding="utf-8", errors="replace") as fh:
+                    return fh.read(5 * 1024 * 1024)
+            except Exception:
+                return None
+        if suffix == ".srt":
+            try:
+                proc = subprocess.run(
+                    ["ffmpeg", "-nostdin", "-y", "-i", str(companion), "-f", "webvtt", "-"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=8
+                )
+                if proc.returncode == 0:
+                    return proc.stdout
+            except Exception:
+                pass
         return None
 
     def reveal_in_finder(self, filename: str, user_id: Optional[str] = None) -> bool:
@@ -1898,7 +2440,7 @@ class DownloaderManager:
 
     def open_downloads_folder(self, subfolder: Optional[str] = None, user_id: Optional[str] = None) -> bool:
         target = resolve_download_path(subfolder, user_id) if subfolder else get_user_root(user_id)
-        if not target or not target.exists():
+        if not target or not target.is_dir():
             target = get_user_root(user_id)
         try:
             import platform

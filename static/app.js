@@ -195,7 +195,7 @@ async function submitRegister() {
   }
   if (!password) {
     if (errorMsg) {
-      errorMsg.innerText = "Введите пароль (от 4 символов)";
+      errorMsg.innerText = "Введите пароль (от 6 символов)";
       errorMsg.style.display = "block";
     }
     return;
@@ -302,6 +302,8 @@ async function openCabinetModal(tab = 'storage') {
     tokenInput.value = currentUser?.token || (currentUser?.username ? `mp_token_${currentUser.username}` : "");
   }
 
+  loadTelegramLinkStatus();
+
   // Show/hide admin tab
   if (adminTabBtn) {
     if (currentUser?.is_admin) {
@@ -388,6 +390,82 @@ async function submitChangePassword() {
   }
 }
 
+// --- Telegram account linking -------------------------------------------------------------------
+let telegramBotUsername = null;
+
+async function loadTelegramLinkStatus() {
+  const section = document.getElementById("cabTelegramSection");
+  if (!section) return;
+  if (!currentUser || currentUser.role === "guest") {
+    section.style.display = "none";
+    return;
+  }
+  section.style.display = "block";
+  try {
+    const res = await fetch("/api/auth/telegram-link");
+    if (!res.ok) return;
+    const data = await res.json();
+    telegramBotUsername = data.bot_username || null;
+    renderTelegramLinkState(Boolean(data.linked));
+  } catch (_) { /* leave the section as it is */ }
+}
+
+function renderTelegramLinkState(linked) {
+  const desc = document.getElementById("cabTelegramDesc");
+  const linkBtn = document.getElementById("btnTelegramLink");
+  const unlinkBtn = document.getElementById("btnTelegramUnlink");
+  const codeBox = document.getElementById("cabTelegramCodeBox");
+  const hint = document.getElementById("cabTelegramHint");
+  if (codeBox) codeBox.style.display = "none";
+  if (hint) hint.style.display = "none";
+  if (desc) {
+    desc.innerText = linked
+      ? "Telegram привязан: бот использует ваш тариф, а файлы можно сохранять в библиотеку (команда /settings в боте)."
+      : "Привяжите Telegram, чтобы бот использовал ваш тариф и мог сохранять файлы в вашу библиотеку.";
+  }
+  if (linkBtn) linkBtn.style.display = linked ? "none" : "inline-flex";
+  if (unlinkBtn) unlinkBtn.style.display = linked ? "inline-flex" : "none";
+}
+
+async function createTelegramLinkCode() {
+  try {
+    const res = await fetch("/api/auth/telegram-link", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Не удалось получить код");
+    const input = document.getElementById("cabTelegramCode");
+    const codeBox = document.getElementById("cabTelegramCodeBox");
+    const hint = document.getElementById("cabTelegramHint");
+    if (input) input.value = `/link ${data.code}`;
+    if (codeBox) codeBox.style.display = "flex";
+    if (hint) {
+      const bot = data.bot_username ? `@${data.bot_username}` : "вашему боту";
+      hint.innerText = `Отправьте эту команду ${bot} в Telegram. Код действует ${Math.round(data.expires_in / 60)} минут.`;
+      hint.style.display = "block";
+    }
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+function copyTelegramLinkCommand() {
+  const input = document.getElementById("cabTelegramCode");
+  if (!input || !input.value) return;
+  navigator.clipboard.writeText(input.value)
+    .then(() => showToast("Команда скопирована", "success"))
+    .catch(() => { input.select(); });
+}
+
+async function unlinkTelegramAccount() {
+  try {
+    const res = await fetch("/api/auth/telegram-link", { method: "DELETE" });
+    if (!res.ok) throw new Error("Не удалось отвязать Telegram");
+    renderTelegramLinkState(false);
+    showToast("Telegram отвязан", "success");
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
 function copyApiToken() {
   const tokenInput = document.getElementById("cabApiTokenInput");
   const copyBtn = document.getElementById("btnCopyApiToken");
@@ -463,7 +541,7 @@ function renderAdminUsersTable(users) {
     const roleSelector = isOwner
       ? `<span class="role-badge admin" style="font-size: 0.72rem;">👑 Создатель</span>`
       : `
-        <select class="admin-role-select" onchange="changeUserRole('${escapeHtml(u.username)}', this.value)">
+        <select class="admin-role-select" onchange="changeUserRole(${jsArg(u.username)}, this.value)">
           <option value="user" ${u.role === 'user' ? 'selected' : ''}>👤 Пользователь</option>
           <option value="premium" ${u.role === 'premium' ? 'selected' : ''}>⭐ Премиум</option>
           <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>👑 Админ</option>
@@ -473,7 +551,7 @@ function renderAdminUsersTable(users) {
     const deleteBtn = isOwner
       ? `<span style="color: var(--text-secondary); font-size: 0.8rem;">—</span>`
       : `
-        <button type="button" class="btn-admin-icon" onclick="adminDeleteUser('${escapeHtml(u.username)}')" title="Удалить пользователя">
+        <button type="button" class="btn-admin-icon" onclick="adminDeleteUser(${jsArg(u.username)})" title="Удалить пользователя">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
         </button>
       `;
@@ -925,7 +1003,7 @@ function renderPlaylistItemsList() {
         statusTypeClass = "error";
       }
 
-      const speedStr = taskInfo.speed && !taskInfo.speed.includes("NA") ? taskInfo.speed : "";
+      const speedStr = taskInfo.speed && !taskInfo.speed.includes("NA") ? escapeHtml(taskInfo.speed) : "";
 
       progressColHtml = `
         <div class="playlist-row-progress-col" id="plRowProgCol-${idx}">
@@ -952,7 +1030,7 @@ function renderPlaylistItemsList() {
       } else if (isCompleted && taskInfo.filename) {
         actionsHtml = `
           <div class="pl-prog-actions" id="plRowActions-${idx}">
-            <button type="button" class="btn-pl-action play" title="Воспроизвести прямо сейчас" onclick="event.stopPropagation(); openPlayerModal('${encodeURIComponent(taskInfo.filename)}')">
+            <button type="button" class="btn-pl-action play" title="Воспроизвести прямо сейчас" onclick="event.stopPropagation(); openPlayerModal(${jsArg(encodeURIComponent(taskInfo.filename))})">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
             </button>
             <a href="/api/files/${encodeURIComponent(taskInfo.filename)}" download="${escapeHtml(taskInfo.filename)}" class="btn-pl-action" title="Сохранить на компьютер" onclick="event.stopPropagation();">
@@ -969,7 +1047,7 @@ function renderPlaylistItemsList() {
       ${bgBarHtml}
       <input type="checkbox" class="playlist-item-checkbox" ${isChecked ? 'checked' : ''} onchange="togglePlaylistItem(${idx})" ${isDownloading ? 'disabled' : ''} />
       <div class="playlist-item-thumb-box">
-        <img src="${thumb}" alt="${cleanTitle}" loading="lazy" onerror="this.style.display='none'" />
+        <img src="${escapeHtml(safeUrl(thumb))}" alt="${cleanTitle}" loading="lazy" onerror="this.style.display='none'" />
         <span class="playlist-item-duration ${item.is_photo ? 'badge-photo' : ''}">${durStr}</span>
       </div>
       <div class="playlist-item-meta">
@@ -1041,7 +1119,7 @@ function updatePlaylistItemProgress(idx, task) {
     statusTypeClass = "error";
   }
 
-  const speedStr = task.speed && !task.speed.includes("NA") ? task.speed : "";
+  const speedStr = task.speed && !task.speed.includes("NA") ? escapeHtml(task.speed) : "";
 
   let progCol = document.getElementById(`plRowProgCol-${idx}`);
   if (!progCol) {
@@ -1094,7 +1172,7 @@ function updatePlaylistItemProgress(idx, task) {
   } else if (isCompleted && (task.filename || existing.filename)) {
     const fn = task.filename || existing.filename;
     actionsContainer.innerHTML = `
-      <button type="button" class="btn-pl-action play" title="Воспроизвести прямо сейчас" onclick="event.stopPropagation(); openPlayerModal('${encodeURIComponent(fn)}')">
+      <button type="button" class="btn-pl-action play" title="Воспроизвести прямо сейчас" onclick="event.stopPropagation(); openPlayerModal(${jsArg(encodeURIComponent(fn))})">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
       </button>
       <a href="/api/files/${encodeURIComponent(fn)}" download="${escapeHtml(fn)}" class="btn-pl-action" title="Сохранить на компьютер" onclick="event.stopPropagation();">
@@ -1494,6 +1572,25 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
+// Argument for an inline handler attribute written as onclick="fn(${jsArg(value)})".
+// escapeHtml() alone is NOT enough there: the browser decodes &#039; back to ' before the JS runs,
+// so a quote inside the value could still break out of a string literal. JSON.stringify produces a
+// correctly escaped JS string literal, escapeHtml then makes it safe for the HTML attribute.
+function jsArg(value) {
+  return escapeHtml(JSON.stringify(String(value ?? "")));
+}
+
+// Only same-origin paths and http(s) URLs may end up in src/href attributes.
+function safeUrl(url) {
+  const u = String(url || "");
+  if (u.startsWith("/") && !u.startsWith("//")) return u;
+  try {
+    const parsed = new URL(u);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") return u;
+  } catch (_) { /* not a URL */ }
+  return "";
+}
+
 // Load existing/active tasks on startup
 async function loadTasksQueue() {
   try {
@@ -1690,6 +1787,7 @@ function handleTaskUpdate(task) {
   // Terminal status notification (toast once per task)
   if (["completed", "error"].includes(task.status) && !terminalNotifiedTasks.has(task.id)) {
     terminalNotifiedTasks.add(task.id);
+    if (terminalNotifiedTasks.size > 500) terminalNotifiedTasks.delete(terminalNotifiedTasks.values().next().value);
     if (task.status === "completed") {
       showToast(`«${task.title || 'Видео'}» успешно скачано!`, "success");
       scheduleHistoryReload();
@@ -1698,6 +1796,8 @@ function handleTaskUpdate(task) {
     }
   }
 }
+
+let globalProgressReconnectTimer = null;
 
 function initGlobalProgressStream() {
   if (globalProgressEventSource) {
@@ -1721,11 +1821,25 @@ function initGlobalProgressStream() {
       }
     };
 
+    globalProgressEventSource.onopen = () => {
+      // Stream is healthy again: polling is no longer needed.
+      if (globalProgressPollTimer) {
+        clearInterval(globalProgressPollTimer);
+        globalProgressPollTimer = null;
+      }
+    };
+
     globalProgressEventSource.onerror = () => {
-      // If SSE stream encounters an error or reconnects, fallback to polling
+      // Fall back to polling and try to restore the stream later instead of staying on polling forever.
       try { globalProgressEventSource.close(); } catch (_) {}
       globalProgressEventSource = null;
       startProgressPollingFallback();
+      if (!globalProgressReconnectTimer) {
+        globalProgressReconnectTimer = setTimeout(() => {
+          globalProgressReconnectTimer = null;
+          initGlobalProgressStream();
+        }, 15000);
+      }
     };
   } catch (e) {
     startProgressPollingFallback();
@@ -1969,11 +2083,11 @@ function renderOrUpdateTaskCard(task) {
   }
 
   // Telemetry string
-  const speedStr = task.speed && !task.speed.includes("NA") ? task.speed : "";
+  const speedStr = task.speed && !task.speed.includes("NA") ? escapeHtml(task.speed) : "";
   const downloadedStr = task.downloaded_str && !task.downloaded_str.includes("NA") && !task.downloaded_str.includes("N/A")
-    ? task.downloaded_str
+    ? escapeHtml(task.downloaded_str)
     : (task.status === "completed" ? "Готово" : "0 B");
-  const etaStr = task.eta && !task.eta.includes("NA") && !task.eta.includes("--") ? `ETA ${task.eta}` : "";
+  const etaStr = task.eta && !task.eta.includes("NA") && !task.eta.includes("--") ? `ETA ${escapeHtml(task.eta)}` : "";
 
   // Right Actions
   let actionsHtml = "";
@@ -1989,7 +2103,7 @@ function renderOrUpdateTaskCard(task) {
   } else if (task.status === "completed" && task.filename) {
     const encodedFn = encodeURIComponent(task.filename);
     actionsHtml = `
-      <button type="button" class="btn-drawer-action play" onclick="openPlayerModal('${encodedFn}')" title="Воспроизвести прямо сейчас">
+      <button type="button" class="btn-drawer-action play" onclick="openPlayerModal(${jsArg(encodedFn)})" title="Воспроизвести прямо сейчас">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
       </button>
       <a href="/api/files/${encodedFn}" download="${escapeHtml(task.filename)}" class="btn-drawer-action download" title="Сохранить файл на диск">
@@ -2699,32 +2813,32 @@ function renderHistoryCards() {
     const encodedName = encodeURIComponent(f.filename);
 
     const checkboxHtml = isMultiSelectMode ? `
-      <div class="card-checkbox-overlay ${isSelected ? 'checked' : ''}" onclick="toggleCardSelection('${escapeHtml(f.filename)}', event)">
+      <div class="card-checkbox-overlay ${isSelected ? 'checked' : ''}" onclick="toggleCardSelection(${jsArg(f.filename)}, event)">
         ${isSelected ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"></polyline></svg>' : ''}
       </div>
     ` : "";
 
     const playlistTagHtml = (f.is_in_playlist && f.playlist_name) ? `
-      <span class="yt-card-playlist-tag" onclick="event.stopPropagation(); openPlaylistDetailView('${escapeHtml(f.playlist_folder)}')" title="Открыть плейлист «${escapeHtml(f.playlist_name)}»">
+      <span class="yt-card-playlist-tag" onclick="event.stopPropagation(); openPlaylistDetailView(${jsArg(f.playlist_folder)})" title="Открыть плейлист «${escapeHtml(f.playlist_name)}»">
         <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12zm-8-2 6-4-6-4v8z"/></svg>
         <span>${f.playlist_index ? '#' + f.playlist_index + ' ' : ''}${escapeHtml(f.playlist_name)}</span>
       </span>
     ` : "";
 
     const playActionBtn = isPhoto ? `
-      <button type="button" class="btn-yt-play" onclick="openLightboxModal('${encodedName}')">
+      <button type="button" class="btn-yt-play" onclick="openLightboxModal(${jsArg(encodedName)})">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
         <span>Просмотр</span>
       </button>
     ` : `
-      <button type="button" class="btn-yt-play" onclick="openPlayerModal('${encodedName}')">
+      <button type="button" class="btn-yt-play" onclick="openPlayerModal(${jsArg(encodedName)})">
         <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
         <span>Смотреть</span>
       </button>
     `;
 
-    const thumbClickAction = isPhoto ? `openLightboxModal('${encodedName}')` : `handleThumbClick(this, '${encodedName}')`;
-    const titleClickAction = isPhoto ? `openLightboxModal('${encodedName}')` : `openPlayerModal('${encodedName}')`;
+    const thumbClickAction = isPhoto ? `openLightboxModal(${jsArg(encodedName)})` : `handleThumbClick(this, ${jsArg(encodedName)})`;
+    const titleClickAction = isPhoto ? `openLightboxModal(${jsArg(encodedName)})` : `openPlayerModal(${jsArg(encodedName)})`;
     const thumbOverlayIcon = isPhoto ? `
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="28" height="28"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
     ` : `
@@ -2734,7 +2848,7 @@ function renderHistoryCards() {
     card.innerHTML = `
       <div class="yt-thumb-wrapper" onclick="${thumbClickAction}" title="${isPhoto ? 'Нажмите для просмотра фото' : 'Нажмите для воспроизведения'}">
         ${checkboxHtml}
-        <img class="yt-thumb-img" src="/api/thumbnail/${encodedName}" alt="${escapeHtml(cleanTitle)}" loading="lazy" onerror="this.src='/api/thumbnail/${encodedName}'">
+        <img class="yt-thumb-img" src="/api/thumbnail/${encodedName}" alt="${escapeHtml(cleanTitle)}" loading="lazy" onerror="this.onerror=null;this.src=${jsArg('/api/thumbnail/' + encodedName)}">
         <div class="yt-thumb-gradient"></div>
         <span class="${qualityClass}">${escapeHtml(f.quality_tag || f.ext)}</span>
         ${durationBadgeHtml}
@@ -2760,14 +2874,14 @@ function renderHistoryCards() {
 
         <div class="yt-card-actions">
           ${playActionBtn}
-          <button type="button" class="btn-card-reveal" title="Показать в Finder на Mac" onclick="revealInFinder('${escapeHtml(f.filename)}')">
+          <button type="button" class="btn-card-reveal" title="Показать в Finder на Mac" onclick="revealInFinder(${jsArg(f.filename)})">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
             <span>Finder</span>
           </button>
-          <a href="/api/files/${encodedName}" download="${f.filename}" class="btn-yt-download" title="Сохранить файл на диск">
+          <a href="/api/files/${encodedName}" download="${escapeHtml(f.filename)}" class="btn-yt-download" title="Сохранить файл на диск">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
           </a>
-          <button type="button" class="btn-yt-delete" title="Удалить файл" onclick="deleteHistoryFile('${encodedName}')">
+          <button type="button" class="btn-yt-delete" title="Удалить файл" onclick="deleteHistoryFile(${jsArg(encodedName)})">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
           </button>
         </div>
@@ -2794,7 +2908,7 @@ function createPlaylistCardElement(pl) {
 
   card.innerHTML = `
     <div class="yt-thumb-wrapper yt-playlist-thumb" title="Открыть плейлист «${escapeHtml(cleanTitle)}»">
-      <img class="yt-thumb-img" src="${thumbUrl}" alt="${escapeHtml(cleanTitle)}" loading="lazy" onerror="this.style.opacity='0.4'">
+      <img class="yt-thumb-img" src="${escapeHtml(safeUrl(thumbUrl))}" alt="${escapeHtml(cleanTitle)}" loading="lazy" onerror="this.style.opacity='0.4'">
       <div class="yt-playlist-overlay-side">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12zm-8-2 6-4-6-4v8z"/></svg>
         <span class="pl-overlay-count">${itemCount}</span>
@@ -2815,18 +2929,18 @@ function createPlaylistCardElement(pl) {
       </div>
 
       <div class="yt-card-actions">
-        <button type="button" class="btn-yt-play" title="Открыть плейлист" onclick="event.stopPropagation(); openPlaylistDetailView('${escapeHtml(pl.folder_name)}')">
+        <button type="button" class="btn-yt-play" title="Открыть плейлист" onclick="event.stopPropagation(); openPlaylistDetailView(${jsArg(pl.folder_name)})">
           <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
           <span>Открыть</span>
         </button>
-        <button type="button" class="btn-card-reveal" title="Показать папку в Finder на Mac" onclick="event.stopPropagation(); openPlaylistInFinder('${escapeHtml(pl.folder_name)}')">
+        <button type="button" class="btn-card-reveal" title="Показать папку в Finder на Mac" onclick="event.stopPropagation(); openPlaylistInFinder(${jsArg(pl.folder_name)})">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
           <span>Finder</span>
         </button>
-        <button type="button" class="btn-yt-download" title="Скачать ZIP архивом" onclick="event.stopPropagation(); downloadPlaylistZipDirect('${escapeHtml(pl.folder_name)}')">
+        <button type="button" class="btn-yt-download" title="Скачать ZIP архивом" onclick="event.stopPropagation(); downloadPlaylistZipDirect(${jsArg(pl.folder_name)})">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
         </button>
-        <button type="button" class="btn-yt-delete" title="Удалить плейлист" onclick="event.stopPropagation(); deletePlaylistFolder('${escapeHtml(pl.folder_name)}')">
+        <button type="button" class="btn-yt-delete" title="Удалить плейлист" onclick="event.stopPropagation(); deletePlaylistFolder(${jsArg(pl.folder_name)})">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
         </button>
       </div>

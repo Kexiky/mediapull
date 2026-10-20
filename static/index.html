@@ -1129,11 +1129,11 @@
           </div>
           <div class="form-group" style="margin-bottom: 14px;">
             <label style="display: block; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px;">Придумайте логин:</label>
-            <input type="text" id="regUsernameInput" class="custom-input" placeholder="Логин (от 3 латинских символов)..." style="width: 100%;" onkeydown="if(event.key==='Enter') submitRegister()">
+            <input type="text" id="regUsernameInput" class="custom-input" placeholder="Логин (3–32 символа: a–z, 0–9, _ -)..." style="width: 100%;" onkeydown="if(event.key==='Enter') submitRegister()">
           </div>
           <div class="form-group" style="margin-bottom: 14px;">
             <label style="display: block; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px;">Пароль:</label>
-            <input type="password" id="regPasswordInput" class="custom-input" placeholder="Пароль (от 4 символов)..." style="width: 100%;" onkeydown="if(event.key==='Enter') submitRegister()">
+            <input type="password" id="regPasswordInput" class="custom-input" placeholder="Пароль (от 6 символов)..." style="width: 100%;" onkeydown="if(event.key==='Enter') submitRegister()">
           </div>
           <div class="form-group" style="margin-bottom: 16px;">
             <label style="display: block; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px;">Повторите пароль:</label>
@@ -1281,7 +1281,7 @@
             </div>
             <div class="form-group" style="margin-bottom: 14px;">
               <label class="cabinet-form-label">Новый пароль:</label>
-              <input type="password" id="cabNewPassInput" class="custom-input" placeholder="Новый пароль (от 4 символов)...">
+              <input type="password" id="cabNewPassInput" class="custom-input" placeholder="Новый пароль (от 6 символов)...">
             </div>
             <p id="cabPassErrorMsg" style="display: none; color: #ff453a; font-size: 0.85rem; margin-bottom: 12px; font-weight: 500;"></p>
             <p id="cabPassSuccessMsg" style="display: none; color: #30d158; font-size: 0.85rem; margin-bottom: 12px; font-weight: 500;"></p>
@@ -1305,6 +1305,24 @@
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                 <span>Копировать</span>
               </button>
+            </div>
+
+            <div id="cabTelegramSection" style="display: none;">
+              <hr style="border: none; border-top: 1px solid rgba(255, 255, 255, 0.08); margin: 18px 0;">
+              <h4 class="cabinet-section-title">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+                <span>Telegram-бот</span>
+              </h4>
+              <p class="cabinet-form-desc" id="cabTelegramDesc">Привяжите Telegram, чтобы бот использовал ваш тариф и мог сохранять файлы в вашу библиотеку.</p>
+              <div class="cabinet-token-box" id="cabTelegramCodeBox" style="display: none;">
+                <input type="text" id="cabTelegramCode" class="custom-input" readonly value="">
+                <button type="button" class="btn-cabinet-copy" onclick="copyTelegramLinkCommand()"><span>Копировать команду</span></button>
+              </div>
+              <p class="cabinet-form-desc" id="cabTelegramHint" style="display: none;"></p>
+              <div style="display: flex; justify-content: flex-end; gap: 10px;">
+                <button type="button" class="btn-cabinet-submit" id="btnTelegramLink" onclick="createTelegramLinkCode()"><span>Привязать Telegram</span></button>
+                <button type="button" class="btn-cabinet-submit" id="btnTelegramUnlink" style="display: none;" onclick="unlinkTelegramAccount()"><span>Отвязать</span></button>
+              </div>
             </div>
           </div>
 
