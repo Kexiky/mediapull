@@ -2,13 +2,18 @@
 #   docker compose build --build-arg PYTHON_IMAGE=my-registry/python:3.12-slim
 ARG PYTHON_IMAGE=python:3.12-slim
 FROM ${PYTHON_IMAGE}
+USER root
 
-# Установка системных зависимостей (FFmpeg, curl, необходимые библиотеки)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Установка системных зависимостей (FFmpeg, curl); шаг пропускается, если базовый образ их уже содержит
+RUN if command -v ffmpeg >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then \
+        echo "ffmpeg and curl already present"; \
+    else \
+        apt-get update && apt-get install -y --no-install-recommends \
+            ffmpeg \
+            curl \
+            ca-certificates \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /app
 
@@ -22,7 +27,9 @@ COPY static/ ./static/
 COPY run.py run_bot.py ./
 
 # Непривилегированный пользователь и директории для персистентных данных и медиа
-RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin app     && mkdir -p /app/data /app/downloads     && chown -R app:app /app
+RUN (id app >/dev/null 2>&1 || useradd --uid 1000 --create-home --shell /usr/sbin/nologin app) \
+    && mkdir -p /app/data /app/downloads \
+    && chown -R app:app /app
 USER app
 
 # Переменные окружения по умолчанию

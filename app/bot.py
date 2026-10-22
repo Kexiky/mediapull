@@ -52,6 +52,8 @@ from aiogram.types import (
     InlineQueryResultCachedPhoto,
     InlineQueryResultCachedVideo,
     InlineQueryResultsButton,
+    InputMediaPhoto,
+    InputMediaVideo,
     Message,
 )
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -61,7 +63,7 @@ from app import bot_store, database
 from app.bot_queue import JobQueue
 from app.downloader import (
     downloader_manager, detect_platform, format_size, format_duration, validate_public_url,
-    normalize_url, DOWNLOADS_DIR,
+    normalize_url, DOWNLOADS_DIR, IMAGE_EXTS, AUDIO_EXTS,
 )
 from app.ratelimit import SlidingWindowLimiter
 from app.roles import ROLE_CONFIGS
@@ -95,6 +97,9 @@ WEBHOOK_HOST = os.getenv("TELEGRAM_WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("TELEGRAM_WEBHOOK_PORT") or 8080)
 WEBHOOK_PATH = "/telegram/webhook"
 
+CAROUSEL_MAX_SLIDES = int(os.getenv("TELEGRAM_MAX_CAROUSEL_SLIDES") or 20)
+TG_ALBUM_SIZE = 10                      # Telegram accepts 2-10 items per media group
+TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024   # larger images must be sent as documents
 STANDARD_HEIGHTS = [2160, 1440, 1080, 720, 480, 360]
 SUBTITLE_LANG_RE = re.compile(r"^[A-Za-z0-9_.*-]{1,20}$")
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
@@ -874,6 +879,36 @@ async def process_link(message: Message, raw_url: str) -> None:
     builder = InlineKeyboardBuilder()
     web_btn_url = format_web_button_url(url)
 
+    # Carousel branch (Instagram multi-image / mixed posts): slides are pictures, so offer pictures
+    if info.get("is_carousel"):
+        entries = (info.get("entries") or [])[:CAROUSEL_MAX_SLIDES]
+        photos = sum(1 for e in entries if e.get("is_photo"))
+        videos = len(entries) - photos
+        pending["img_index"] = parse_img_index(raw_url, len(entries))
+        if settings["quality_pref"] != "ask":
+            await execute_action(status_msg.bot, status_msg, tg_id, session_key, pending, "car_all", "best")
+            return
+        if pending["img_index"]:
+            builder.row(InlineKeyboardButton(text=f"📍 Только слайд №{pending['img_index']} (как в ссылке)",
+                                             callback_data=f"tg:car_one:{session_key}"))
+        what = f"{photos} фото" + (f" + {videos} видео" if videos else "")
+        builder.row(InlineKeyboardButton(text=f"🖼 Все слайды ({what}) альбомом", callback_data=f"tg:car_all:{session_key}"))
+        bottom_buttons = []
+        if web_btn_url:
+            bottom_buttons.append(InlineKeyboardButton(text="🌐 Открыть в Web (ZIP-архив)", url=web_btn_url))
+        bottom_buttons.append(InlineKeyboardButton(text="❌ Отмена", callback_data=f"tg:cancel:{session_key}"))
+        builder.row(*bottom_buttons)
+        caption = (
+            f"🖼 <b>Карусель:</b> <b>{safe_title}</b>\n\n"
+            f"👤 Автор: <b>{safe_uploader}</b>\n"
+            f"🔢 Слайдов: <b>{len(entries)}</b> ({what})\n"
+            f"🏷️ Сервис: <b>{platform.get('name', 'Media')}</b>\n\n"
+            "Пришлю картинки альбомом, а не видео. "
+            "<i>Музыку поста Instagram без входа в аккаунт не отдаёт — её скачать не получится.</i>"
+        )
+        await status_msg.edit_text(caption, reply_markup=builder.as_markup(), parse_mode="HTML")
+        return
+
     # Playlist branch
     if info.get("is_playlist"):
         item_count = info.get("item_count", 0)
@@ -1080,7 +1115,7 @@ async def send_media(bot: Bot, chat_id: int, kind: str, media, *, title: str, ca
     if kind == "audio":
         return await bot.send_audio(audio=media, title=title[:100], **common)
     if kind == "photo":
-        return await bot.send_photo(photo=media, **common)
+        return await bot.send_photo(photo=media, caption=caption, **common)
     return await bot.send_document(document=media, caption=caption, **common)
 
 
@@ -1097,6 +1132,44 @@ def extract_file_id(sent: Message, kind: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+async def wait_for_task(task_id: str, status_msg: Optional[Message] = None, safe_title: str = "") -> Path:
+    """Wait until a download task completes and return its file. Raises RuntimeError on failure or timeout."""
+    start_time = time.time()
+    last_progress = -1
+    while True:
+        task = downloader_manager.tasks.get(task_id)
+        if not task:
+            raise RuntimeError("Задача загрузки потеряна.")
+        if task.status == "completed":
+            break
+        if task.status in ("error", "cancelled"):
+            raise RuntimeError(task.error or "Неизвестная ошибка скачивания")
+        if time.time() - start_time > DOWNLOAD_TIMEOUT_SECONDS:
+            raise RuntimeError("Превышено время ожидания загрузки.")
+
+        cur_prog = int(task.progress)
+        if status_msg and cur_prog >= last_progress + 8 and cur_prog <= 95:
+            last_progress = cur_prog
+            try:
+                await status_msg.edit_text(
+                    f"⏳ <b>Скачивание медиа:</b>\n"
+                    f"📌 <i>{safe_title}</i>\n\n"
+                    f"📊 Прогресс: <b>{cur_prog}%</b> ({task.speed or '---'})\n"
+                    f"<i>Подготовка файла для отправки...</i>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(1.2)
+
+    if not task.filepath:
+        raise RuntimeError("Файл не был сформирован.")
+    filepath = Path(task.filepath)
+    if not filepath.exists():
+        raise RuntimeError(f"Файл {filepath.name} не найден на диске.")
+    return filepath
 
 
 async def download_and_send_single(
@@ -1175,40 +1248,18 @@ async def download_and_send_single(
                 role=owner_role
             )
 
-            start_time = time.time()
-            last_progress = -1
-            while True:
-                task = downloader_manager.tasks.get(task_id)
-                if not task:
-                    raise RuntimeError("Задача загрузки потеряна.")
-                if task.status == "completed":
-                    break
-                if task.status in ("error", "cancelled"):
-                    raise RuntimeError(task.error or "Неизвестная ошибка скачивания")
-                if time.time() - start_time > DOWNLOAD_TIMEOUT_SECONDS:
-                    raise RuntimeError("Превышено время ожидания загрузки.")
+            filepath = await wait_for_task(task_id, status_msg, safe_title)
 
-                cur_prog = int(task.progress)
-                if status_msg and cur_prog >= last_progress + 8 and cur_prog <= 95:
-                    last_progress = cur_prog
-                    try:
-                        await status_msg.edit_text(
-                            f"⏳ <b>Скачивание медиа:</b>\n"
-                            f"📌 <i>{safe_title}</i>\n\n"
-                            f"📊 Прогресс: <b>{cur_prog}%</b> ({task.speed or '---'})\n"
-                            f"<i>Подготовка файла для отправки...</i>",
-                            parse_mode="HTML"
-                        )
-                    except Exception:
-                        pass
-                await asyncio.sleep(1.2)
-
-            task = downloader_manager.tasks.get(task_id)
-            if not task or task.status != "completed" or not task.filepath:
-                raise RuntimeError("Файл не был сформирован.")
-            filepath = Path(task.filepath)
-            if not filepath.exists():
-                raise RuntimeError(f"Файл {filepath.name} не найден на диске.")
+            # Trust the file, not the request: an image must never be uploaded as a "video" (and vice versa).
+            suffix = filepath.suffix.lower()
+            if action in ("video", "audio") and suffix in IMAGE_EXTS:
+                action, kind = "photo", "photo"
+            elif action == "video" and suffix in AUDIO_EXTS:
+                action, kind = "audio", "audio"
+            if kind == "photo" and filepath.stat().st_size > TG_PHOTO_MAX_BYTES:
+                kind = "document"  # Telegram rejects photos above 10 MB
+            if kind != "video":
+                caption = None
 
             target_to_send = filepath
             if action == "video" and filepath.stat().st_size > MAX_TG_SIZE_BYTES:
@@ -1278,6 +1329,217 @@ async def download_and_send_single(
             compressed.unlink(missing_ok=True)  # library mode keeps the original, not the Telegram-sized copy
 
 
+def parse_img_index(raw_url: str, count: int) -> Optional[int]:
+    """`?img_index=3` in an Instagram link is the 1-based slide the user was looking at."""
+    try:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(raw_url).query)
+        n = int(query.get("img_index", [""])[0])
+    except (ValueError, IndexError):
+        return None
+    return n if 1 <= n <= count else None
+
+
+async def _download_slides(todo: List[Dict[str, Any]], job_id: str, owner_id: str, owner_role: str,
+                           library_title: Optional[str], status_msg: Optional[Message], task_ids: List[str]) -> int:
+    """Download the given slides in parallel (bounded by the downloader). Returns the number of failures."""
+    done = 0
+    failed = 0
+    lock = asyncio.Lock()
+
+    async def one(slot: Dict[str, Any]) -> None:
+        nonlocal done, failed
+        entry, idx = slot["entry"], slot["idx"]
+        task_id = f"tg_{job_id}_{idx}"
+        task_ids.append(task_id)
+        is_photo = slot["kind"] == "photo"
+        try:
+            await downloader_manager.start_download(
+                task_id=task_id,
+                url=entry["url"],
+                title=entry.get("title") or f"Слайд {idx}",
+                mode="photo" if is_photo else "single",
+                quality="720",
+                video_format="mp4",
+                is_photo=is_photo,
+                photo_url=(entry.get("direct_url") or entry["url"]) if is_photo else None,
+                playlist_title=library_title,
+                playlist_index=idx if library_title else None,
+                user_id=owner_id,
+                role=owner_role,
+            )
+            slot["path"] = await wait_for_task(task_id)
+        except Exception as e:
+            print(f"[Bot] carousel slide {idx} failed: {e}")
+            slot["error"] = str(e)
+        async with lock:
+            done += 1
+            failed += 1 if not slot.get("path") else 0
+            if status_msg:
+                try:
+                    await status_msg.edit_text(f"⏳ <b>Скачиваю слайды:</b> {done}/{len(todo)}", parse_mode="HTML")
+                except Exception:
+                    pass
+
+    await asyncio.gather(*(one(s) for s in todo))
+    return failed
+
+
+async def _send_slides(bot: Bot, chat_id: int, slots: List[Dict[str, Any]], caption: Optional[str], save_ids: bool,
+                       source_url: str, title: str) -> int:
+    """Send every not-yet-sent slide: albums of up to 10 (a lone slide as a plain photo/video). Returns bytes sent."""
+    ready = [s for s in slots if not s.get("sent") and (s.get("file_id") or s.get("path"))]
+    total = 0
+
+    # Videos above the upload limit are squeezed first; oversized pictures go as documents.
+    for s in ready:
+        s["send_kind"] = s["kind"]
+        path = s.get("path")
+        if not path:
+            continue
+        size = path.stat().st_size
+        total += size
+        if s["kind"] == "video" and size > MAX_TG_SIZE_BYTES:
+            async with compress_lock:
+                s["path"] = await asyncio.to_thread(compress_video_for_telegram, path)
+        elif s["kind"] == "photo" and size > TG_PHOTO_MAX_BYTES:
+            s["send_kind"] = "document"
+
+    first_caption = caption
+    docs = [s for s in ready if s["send_kind"] == "document"]
+    for s in docs:
+        sent = await bot.send_document(chat_id=chat_id, document=FSInputFile(str(s["path"])), caption=first_caption)
+        first_caption = None
+        s["sent"] = True
+        if save_ids and (fid := extract_file_id(sent, "document")):
+            bot_store.cache_put(s["key"], "document", fid, s["path"].stat().st_size, title, source_url)
+
+    album = [s for s in ready if s["send_kind"] != "document"]
+    if len(album) == 1:
+        s = album[0]
+        ref = s.get("file_id") or FSInputFile(str(s["path"]))
+        w = h = d = 0
+        if s["kind"] == "video" and s.get("path"):
+            w, h, d = await asyncio.to_thread(get_video_dimensions_and_duration, s["path"])
+        sent = await send_media(bot, chat_id, s["kind"], ref, title=title, caption=first_caption, width=w, height=h, duration=d)
+        s["sent"] = True
+        if save_ids and (fid := extract_file_id(sent, s["kind"])):
+            bot_store.cache_put(s["key"], s["kind"], fid, s["path"].stat().st_size if s.get("path") else 0, title, source_url)
+        return total
+
+    for start in range(0, len(album), TG_ALBUM_SIZE):
+        chunk = album[start:start + TG_ALBUM_SIZE]
+        media = []
+        for s in chunk:
+            ref = s.get("file_id") or FSInputFile(str(s["path"]))
+            cap = first_caption if (first_caption and not media) else None
+            if s["kind"] == "photo":
+                media.append(InputMediaPhoto(media=ref, caption=cap))
+            else:
+                w, h, d = (0, 0, 0)
+                if s.get("path"):
+                    w, h, d = await asyncio.to_thread(get_video_dimensions_and_duration, s["path"])
+                media.append(InputMediaVideo(media=ref, caption=cap, supports_streaming=True,
+                                             width=w or None, height=h or None, duration=d or None))
+        first_caption = None
+        if len(media) == 1:
+            s = chunk[0]
+            sent_one = await send_media(bot, chat_id, s["kind"], media[0].media, title=title, caption=None)
+            messages = [sent_one]
+        else:
+            messages = await bot.send_media_group(chat_id=chat_id, media=media)
+        for s, m in zip(chunk, messages):
+            s["sent"] = True
+            if save_ids and (fid := extract_file_id(m, s["kind"])):
+                size = s["path"].stat().st_size if s.get("path") else 0
+                bot_store.cache_put(s["key"], s["kind"], fid, size, title, source_url)
+    return total
+
+
+async def send_carousel(bot: Bot, msg: Message, tg_id: int, data: Dict[str, Any], only_index: Optional[int] = None) -> None:
+    """Deliver the slides of a carousel post as photos/videos in albums, using the file_id cache where possible."""
+    entries = (data.get("entries") or [])[:CAROUSEL_MAX_SLIDES]
+    selected = [(i, e) for i, e in enumerate(entries, 1) if only_index is None or i == only_index]
+    if not selected:
+        raise RuntimeError("В посте нет слайдов для отправки.")
+
+    identity = resolve_identity(tg_id)
+    settings = bot_store.get_settings(tg_id)
+    library = bool(settings["save_library"] and identity.web_user)
+    title = data["title"]
+    caption = title[:1000] if settings["caption_mode"] == "title" and title else None
+    platform_id = data.get("platform_id", "web")
+    source_url = data.get("source_url") or normalize_url(data["url"])
+    chat_id = msg.chat.id
+
+    job_id = secrets.token_hex(6)
+    if library:
+        owner_id, owner_role, job_dir = identity.web_user["username"], identity.web_user["role"], None
+        library_title = f"Instagram {title}"[:80]
+    else:
+        owner_id, owner_role, job_dir = f"tg_temp_{job_id}", identity.role, TEMP_TG_DIR / job_id
+        library_title = None
+
+    slots: List[Dict[str, Any]] = []
+    for idx, entry in selected:
+        kind = "video" if entry.get("is_video") else "photo"
+        key = make_cache_key(f"{platform_id}:{entry.get('id') or idx}", kind, "best")
+        hit = None if library else bot_store.cache_get(key)
+        slots.append({"idx": idx, "entry": entry, "kind": kind, "key": key,
+                      "file_id": hit["file_id"] if hit else None, "path": None})
+
+    task_ids: List[str] = []
+    failed = 0
+    total_bytes = 0
+    try:
+        for attempt in range(2):
+            todo = [s for s in slots if not s.get("sent") and not s.get("file_id") and not s.get("path") and not s.get("error")]
+            if todo:
+                async def on_position(position: int, eta: int):
+                    await msg.edit_text(f"⏳ <b>В очереди:</b> позиция {position}\nОриентировочное ожидание: ~{max(1, eta // 60)} мин.",
+                                        parse_mode="HTML")
+                started = await job_queue.acquire(on_position)
+                try:
+                    await msg.edit_text(f"⏳ <b>Скачиваю слайды:</b> 0/{len(todo)}", parse_mode="HTML")
+                    failed += await _download_slides(todo, job_id, owner_id, owner_role, library_title, msg, task_ids)
+                finally:
+                    job_queue.release(started)
+
+            deliverable = [s for s in slots if s.get("file_id") or s.get("path")]
+            if not deliverable:
+                reasons = {s.get("error") for s in slots if s.get("error")}
+                raise RuntimeError("Не удалось скачать ни одного слайда." + (f" {next(iter(reasons))}" if reasons else ""))
+            try:
+                await msg.edit_text(f"📤 <b>Отправка в Telegram...</b>\nСлайдов: {len(deliverable)}", parse_mode="HTML")
+            except Exception:
+                pass
+            try:
+                total_bytes += await _send_slides(bot, chat_id, slots, caption, save_ids=not library,
+                                                  source_url=source_url, title=title)
+                break
+            except TelegramBadRequest:
+                stale = [s for s in slots if s.get("file_id") and not s.get("sent")]
+                if attempt == 0 and stale:
+                    for s in stale:  # the cached file_id is stale: forget it and download these slides for real
+                        bot_store.cache_delete(s["key"])
+                        s["file_id"] = None
+                    continue
+                raise
+        bot_store.record_event(tg_id, size=total_bytes)
+        if failed:
+            await bot.send_message(chat_id, f"⚠️ Не удалось скачать слайдов: {failed}.")
+        if library:
+            await bot.send_message(chat_id, "💾 Копии сохранены в вашей веб-библиотеке.")
+    except Exception:
+        bot_store.record_event(tg_id, ok=False)
+        raise
+    finally:
+        for tid in task_ids:
+            downloader_manager.cancel_task(tid)
+            downloader_manager.tasks.pop(tid, None)
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
 def make_variant(action: str, quality: str, lang: str) -> str:
     return lang if action == "subs" else ("audio" if action == "audio" else quality)
 
@@ -1304,6 +1566,24 @@ async def _execute_action(bot: Bot, msg: Message, tg_id: int, session_key: str, 
     media_id = data.get("media_id") or media_identity({}, url)
     source_url = data.get("source_url") or normalize_url(url)
     reply_to = None  # menu messages already sit under the user's request
+
+    # Instagram-style carousel: deliver the slides as an album of photos (and videos), never as a "video"
+    if action in ("car_all", "car_one"):
+        only = data.get("img_index") if action == "car_one" else None
+        try:
+            await send_carousel(bot, msg, tg_id, data, only_index=only)
+            pending_downloads.pop(session_key, None)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[Bot Error] carousel: {e}")
+            try:
+                await msg.edit_text(f"❌ <b>Не удалось отправить слайды:</b>\n<code>{html.escape(str(e)[-600:])}</code>", parse_mode="HTML")
+            except Exception:
+                pass
+        return
 
     # Playlist batch execution (all or first 5)
     if action in ("pla_all", "plv_all", "pla_5", "plv_5"):
@@ -1343,7 +1623,7 @@ async def _execute_action(bot: Bot, msg: Message, tg_id: int, session_key: str, 
             except Exception:
                 pass
 
-            item_action = "audio" if is_audio else "video"
+            item_action = "photo" if item.get("is_photo") else ("audio" if is_audio else "video")
             item_id = item.get("id")
             try:
                 success = await download_and_send_single(
@@ -1355,6 +1635,7 @@ async def _execute_action(bot: Bot, msg: Message, tg_id: int, session_key: str, 
                     action=item_action,
                     quality="720",
                     status_msg=None,
+                    photo_url=item.get("direct_url") if item_action == "photo" else None,
                     cache_key=make_cache_key(f"{data.get('platform_id', 'web')}:{item_id}", item_action,
                                              make_variant(item_action, "720", lang)) if item_id else None,
                     source_url=normalize_url(item_url),
@@ -1454,6 +1735,8 @@ async def handle_callback_download(callback: CallbackQuery, bot: Bot):
     elif act_type == "s" and len(parts) >= 4 and SUBTITLE_LANG_RE.match(parts[2]):
         lang, session_key, action = parts[2], parts[3], "subs"
     elif act_type in ("pla_all", "plv_all", "pla_5", "plv_5"):
+        session_key, action = parts[2], act_type
+    elif act_type in ("car_all", "car_one"):
         session_key, action = parts[2], act_type
     elif act_type == "cancel":
         pending_downloads.pop(parts[2], None)

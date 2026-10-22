@@ -346,6 +346,16 @@ class FakeBot:
     async def send_message(self, *a, **kw):
         self.sent.append(("message", a, None))
 
+    async def send_media_group(self, chat_id, media, **kw):
+        results = []
+        refs = []
+        for m in media:
+            ref = self._check(m.media)
+            refs.append(ref)
+            results.append(self._result("photo" if type(m).__name__ == "InputMediaPhoto" else "video"))
+        self.sent.append(("album", [(type(m).__name__, r) for m, r in zip(media, refs)], media[0].caption))
+        return results
+
 
 @pytest.fixture
 def media_url(tmp_path):
@@ -600,3 +610,157 @@ def test_job_queue_cancelled_waiter_leaves_the_line():
         q.release(again)
 
     run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Instagram-style carousels: pictures must arrive as pictures, not as "videos"
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def carousel_server(tmp_path, monkeypatch):
+    """Local server with three JPEG slides and one MP4 slide; private addresses allowed for the test."""
+    monkeypatch.setattr(downloader, "ALLOW_PRIVATE_URLS", True)
+    root = tmp_path / "car"
+    root.mkdir()
+    for i, color in enumerate(("red", "green", "blue"), 1):
+        res = subprocess.run(["ffmpeg", "-nostdin", "-y", "-f", "lavfi", "-i", f"color=c={color}:s=320x400", "-frames:v", "1",
+                              str(root / f"slide{i}.jpg")], capture_output=True, timeout=60)
+        if res.returncode != 0:
+            pytest.skip("ffmpeg cannot generate sample images")
+    res = subprocess.run(["ffmpeg", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=15",
+                          "-c:v", "libx264", "-pix_fmt", "yuv420p", str(root / "slide4.mp4")], capture_output=True, timeout=60)
+    if res.returncode != 0:
+        pytest.skip("ffmpeg cannot generate the sample clip")
+    handler = partial(SimpleHTTPRequestHandler, directory=str(root))
+    handler.log_message = lambda *a, **k: None
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    yield base
+    server.shutdown()
+
+
+def carousel_data(base, with_video=False, img_index=None):
+    entries = []
+    for i in (1, 2, 3):
+        url = f"{base}/slide{i}.jpg"
+        entries.append({"id": f"POST_{i}", "title": f"Слайд {i}: Фото", "url": url, "direct_url": url,
+                        "is_photo": True, "is_video": False})
+    if with_video:
+        url = f"{base}/slide4.mp4"
+        entries.append({"id": "POST_4", "title": "Слайд 4: Видео", "url": url, "direct_url": url,
+                        "is_photo": False, "is_video": True})
+    return {"url": "https://www.instagram.com/p/POST/", "title": "Оба два три", "entries": entries, "is_playlist": True,
+            "platform_id": "instagram", "source_url": "https://www.instagram.com/p/POST/", "img_index": img_index}
+
+
+class FakeStatus:
+    def __init__(self):
+        self.chat = SimpleNamespace(id=1)
+        self.edits, self.deleted = [], False
+
+    async def edit_text(self, text, **kw):
+        self.edits.append((text, kw))
+
+    async def delete(self):
+        self.deleted = True
+
+
+def test_carousel_is_delivered_as_an_album_of_photos_never_as_video(carousel_server):
+    async def scenario():
+        fake = FakeBot()
+        await bot.send_carousel(fake, FakeStatus(), 77, carousel_data(carousel_server))
+        return fake
+
+    fake = run(scenario())
+    kinds = [s[0] for s in fake.sent]
+    assert kinds == ["album"], kinds                                   # one album, no send_video / send_document
+    assert [name for name, _ in fake.sent[0][1]] == ["InputMediaPhoto"] * 3
+    assert list(bot.TEMP_TG_DIR.glob("*")) == [] and tg_tasks() == []
+    assert bot_store.stats_summary()["downloads_total"] == 1
+
+
+def test_mixed_carousel_keeps_photos_and_videos_in_one_album(carousel_server):
+    fake = FakeBot()
+    run(bot.send_carousel(fake, FakeStatus(), 77, carousel_data(carousel_server, with_video=True)))
+    assert [name for name, _ in fake.sent[0][1]] == ["InputMediaPhoto"] * 3 + ["InputMediaVideo"]
+
+
+def test_second_request_for_the_same_carousel_uses_cached_file_ids(carousel_server):
+    data = carousel_data(carousel_server)
+
+    async def scenario():
+        fake = FakeBot()
+        await bot.send_carousel(fake, FakeStatus(), 77, data)
+        tasks_before = len(downloader.downloader_manager.tasks)
+        await bot.send_carousel(fake, FakeStatus(), 78, data)
+        return fake, tasks_before
+
+    fake, _ = run(scenario())
+    first, second = fake.sent
+    assert all(ref.endswith(".jpg") for _, ref in first[1])               # uploaded files the first time
+    assert [ref for _, ref in second[1]] == ["FILEID1", "FILEID2", "FILEID3"]  # instant the second time
+    assert list(bot.TEMP_TG_DIR.glob("*")) == []
+
+
+def test_only_the_slide_from_the_link_can_be_sent(carousel_server):
+    fake = FakeBot()
+    run(bot.send_carousel(fake, FakeStatus(), 77, carousel_data(carousel_server, img_index=2), only_index=2))
+    assert [s[0] for s in fake.sent] == ["photo"] and fake.sent[0][1].endswith(".jpg")
+
+
+def test_carousel_caption_goes_on_the_first_item_only(carousel_server):
+    bot_store.set_setting(77, "caption_mode", "title")
+    fake = FakeBot()
+    run(bot.send_carousel(fake, FakeStatus(), 77, carousel_data(carousel_server)))
+    assert fake.sent[0][2] == "Оба два три"
+
+
+def test_partial_failure_still_sends_the_slides_that_worked(carousel_server):
+    data = carousel_data(carousel_server)
+    data["entries"][1]["url"] = data["entries"][1]["direct_url"] = f"{carousel_server}/missing.jpg"
+    fake = FakeBot()
+    run(bot.send_carousel(fake, FakeStatus(), 77, data))
+    assert len(fake.sent[0][1]) == 2
+    assert any(s[0] == "message" for s in fake.sent)                      # the user is told one slide was skipped
+
+
+def test_an_image_requested_as_video_is_sent_as_a_photo(carousel_server):
+    """The original bug: a slide URL fed to the video pipeline came out of the bot as a 'video'."""
+    async def scenario():
+        fake = FakeBot()
+        await bot.download_and_send_single(fake, 1, 77, f"{carousel_server}/slide1.jpg", "Слайд", "video", "720")
+        return fake
+
+    fake = run(scenario())
+    assert [s[0] for s in fake.sent] == ["photo"]
+
+
+def test_carousel_menu_offers_photos_and_the_slide_from_the_link(monkeypatch):
+    info = {"is_playlist": True, "is_carousel": True, "title": "Оба два три", "uploader": "@x",
+            "platform": {"id": "instagram", "name": "Instagram"}, "item_count": 3,
+            "entries": [{"id": f"P_{i}", "title": f"Слайд {i}", "url": f"https://cdn.example/{i}.jpg",
+                         "is_photo": True, "is_video": False} for i in (1, 2, 3)]}
+    status = FakeStatus()
+    status.bot = None
+
+    async def fake_fetch(message, raw_url, status_text=""):
+        return "https://www.instagram.com/p/POST/", info, status
+
+    monkeypatch.setattr(bot, "fetch_info", fake_fetch)
+    msg = FakeMessage("x")
+    run(bot.process_link(msg, "https://www.instagram.com/p/POST/?img_index=3&mdxt=abc"))
+    text, kw = status.edits[-1]
+    buttons = [b.callback_data for row in kw["reply_markup"].inline_keyboard for b in row if b.callback_data]
+    assert any(c.startswith("tg:car_one:") for c in buttons) and any(c.startswith("tg:car_all:") for c in buttons)
+    assert not any("plv_" in c or "pla_" in c or c.startswith("tg:v:") for c in buttons)   # no video/MP3 menu for pictures
+    assert "Только слайд №3" in str(kw["reply_markup"]) and "3 фото" in str(kw["reply_markup"])
+    assert "альбомом" in text or "картинки" in text
+
+
+def test_img_index_parsing():
+    f = bot.parse_img_index
+    assert f("https://www.instagram.com/p/X/?img_index=3&mdxt=OXgx", 9) == 3
+    assert f("https://www.instagram.com/p/X/?img_index=10", 9) is None
+    assert f("https://www.instagram.com/p/X/?img_index=0", 9) is None
+    assert f("https://www.instagram.com/p/X/?img_index=abc", 9) is None
+    assert f("https://www.instagram.com/p/X/", 9) is None

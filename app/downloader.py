@@ -1208,6 +1208,9 @@ class DownloaderManager:
         if "instagram.com" in url.lower():
             try:
                 ig_data = await asyncio.to_thread(extract_instagram_post, url)
+                if not ig_data:
+                    await asyncio.sleep(1.0)
+                    ig_data = await asyncio.to_thread(extract_instagram_post, url)
                 if ig_data:
                     user = ig_data.get("user") or {}
                     username = user.get("username", "instagram")
@@ -1355,6 +1358,11 @@ class DownloaderManager:
                         }
                 except Exception:
                     pass
+            if "instagram.com" in url.lower() and "No video formats found" in err_msg:
+                raise ValueError(
+                    "В этом посте Instagram только фотографии, а получить их не удалось "
+                    "(Instagram временно ограничил доступ). Повторите попытку позже."
+                )
             raise ValueError(err_msg or "Failed to extract video information")
 
         try:
